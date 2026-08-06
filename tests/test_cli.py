@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -62,11 +63,38 @@ class TestEnvelope:
     def test_failure_has_a_stable_shape(self, capfd):
         code, payload, _ = invoke(capfd, ["frobnicate"])
 
-        assert code == 1
+        assert code == transcribe_cli.USAGE_EXIT_CODE
         assert payload["ok"] is False
         assert payload["action"] == "frobnicate"
         assert "error" in payload and "result" not in payload
         assert set(payload["error"]) == {"type", "message", "details"}
+
+    def test_a_malformed_call_and_a_failed_one_exit_differently(self, capfd, tmp_path):
+        """The whole point of exit 2: telling "called wrong" from "work failed"."""
+        usage, _, _ = invoke(capfd, ["frobnicate"])
+        failure, payload, _ = invoke(
+            capfd, ["probe", "--audio", str(tmp_path / "absent.m4a")]
+        )
+
+        assert usage == transcribe_cli.USAGE_EXIT_CODE
+        assert failure == transcribe_cli.FAILURE_EXIT_CODE
+        assert payload["error"]["type"] == RESOURCE_NOT_FOUND
+
+    def test_version_reports_tool_and_schema_as_json(self, capfd):
+        code, payload, _ = invoke(capfd, ["--version"])
+
+        assert code == 0
+        assert payload["ok"] is True
+        assert payload["action"] == "version"
+        assert payload["result"]["version"] == transcribe_cli.tool_version()
+        assert payload["result"]["schema_version"] == transcribe_cli.SCHEMA_VERSION
+
+    def test_version_matches_the_declared_project_version(self):
+        with (ROOT / "pyproject.toml").open("rb") as handle:
+            declared = tomllib.load(handle)["project"]["version"]
+
+        assert transcribe_cli.tool_version() == declared
+        assert transcribe_cli.tool_version() != transcribe_cli.FALLBACK_TOOL_VERSION
 
     def test_every_action_reports_the_same_top_level_keys(self, capfd, tmp_path):
         shapes = set()
@@ -139,7 +167,7 @@ class TestValidation:
     def test_no_action_is_rejected(self, capfd):
         code, payload, _ = invoke(capfd, [])
 
-        assert code == 1
+        assert code == transcribe_cli.USAGE_EXIT_CODE
         assert payload["error"]["type"] == INVALID_ARGUMENTS
 
     def test_an_unknown_flag_is_rejected_rather_than_ignored(self, capfd):
@@ -691,6 +719,42 @@ class TestJobActions:
 
         assert len(payload["result"]["jobs"]) == 2
 
+    def test_a_capped_listing_says_so(self, capfd, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcribe_cli, "_process_alive", lambda pid: True)
+        for index in range(5):
+            write_job(tmp_path, f"job-{index}")
+
+        _, payload, _ = invoke(capfd, ["job-list", "--jobs-dir", str(tmp_path), "--limit", "2"])
+
+        assert payload["meta"]["truncated"] is True
+        assert payload["meta"]["count"] == 2
+        assert payload["meta"]["total"] == 5
+
+    def test_a_complete_listing_is_not_flagged_as_truncated(self, capfd, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcribe_cli, "_process_alive", lambda pid: True)
+        for index in range(3):
+            write_job(tmp_path, f"job-{index}")
+
+        _, payload, _ = invoke(capfd, ["job-list", "--jobs-dir", str(tmp_path), "--limit", "10"])
+
+        assert payload["meta"]["truncated"] is False
+        assert payload["meta"]["count"] == payload["meta"]["total"] == 3
+
+    def test_truncation_counts_only_what_the_state_filter_matched(
+        self, capfd, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcribe_cli, "_process_alive", lambda pid: True)
+        for index in range(4):
+            write_job(tmp_path, f"running-{index}")
+        write_job(tmp_path, "cancelled-1", state="cancelled")
+
+        _, payload, _ = invoke(
+            capfd, ["job-list", "--jobs-dir", str(tmp_path), "--state", "cancelled"]
+        )
+
+        assert payload["meta"]["total"] == 1
+        assert payload["meta"]["truncated"] is False
+
     def test_an_absent_jobs_directory_lists_nothing(self, capfd, tmp_path):
         _, payload, _ = invoke(capfd, ["job-list", "--jobs-dir", str(tmp_path / "never")])
 
@@ -753,7 +817,7 @@ class TestExecutable:
             [str(EXECUTABLE), "frobnicate"], capture_output=True, text=True, cwd=ROOT
         )
 
-        assert completed.returncode == 1
+        assert completed.returncode == transcribe_cli.USAGE_EXIT_CODE
         assert json.loads(completed.stdout)["error"]["type"] == INVALID_ARGUMENTS
 
     def test_the_wrapper_is_executable(self):

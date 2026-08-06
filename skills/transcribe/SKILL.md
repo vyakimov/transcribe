@@ -1,7 +1,7 @@
 ---
 name: transcribe
 description: Transcribe audio into a speaker-attributed, timestamped transcript via the repository's `bin/transcribe` JSON CLI. Use for transcription, diarization ("who spoke when"), speaker attribution, interview and meeting recordings, or when asked to check transcription setup or estimate a run before spending money.
-version: 1.0
+version: 1.1
 license: same as the containing repository
 ---
 
@@ -30,13 +30,20 @@ allowlist as a single absolute path.
 Progress, model chatter, and subprocess noise go to `stderr` and can be ignored.
 
 ```json
-{"ok": true,  "action": "probe", "result": { }, "meta": {"schema_version": "1.1"}}
+{"ok": true,  "action": "probe", "result": { }, "meta": {"schema_version": "1.2"}}
 {"ok": false, "action": "probe", "error": {"type": "resource_not_found",
                                            "message": "...", "details": { }},
-                                 "meta": {"schema_version": "1.1"}}
+                                 "meta": {"schema_version": "1.2"}}
 ```
 
-Exit code is `0` when `ok` is true, `1` when it is false.
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Success — `ok` is true |
+| `2` | The call was malformed; `error.type` is `invalid_arguments`. Fix the call, never retry it unchanged |
+| `1` | Every other failure — the call was well formed, the work failed |
+
+`2` is worth branching on before you parse anything: it means the problem is in
+your arguments, not in the audio, the network, or the credentials.
 
 **Parse stdout. Branch on `error.type`, never on `error.message`** — types are
 stable, messages are not.
@@ -55,6 +62,17 @@ with every parameter. Summary:
 | `job-status` | no | free | Poll a detached run |
 | `job-list` | no | free | List detached runs, newest first |
 | `job-cancel` | yes | free | Stop a running detached run |
+
+`--version` is a flag rather than an action, and answers as a normal envelope
+with `"action": "version"`:
+
+```json
+{"ok": true, "action": "version",
+ "result": {"name": "transcribe", "version": "0.1.0", "schema_version": "1.2"}}
+```
+
+Check `result.schema_version` before relying on anything this document
+describes; the payload shapes here are the `1.x` contract.
 
 ### transcribe
 
@@ -150,10 +168,16 @@ than the tail in `recent_stderr`.
 | `--state` | Only return jobs in one state: `running`, `succeeded`, `failed`, or `cancelled` |
 | `--jobs-dir DIR` | Where job state lives (default `.transcribe-jobs/`, or `$TRANSCRIBE_JOBS_DIR`) |
 
-The list is **capped silently**: exactly `--limit` entries means older jobs may
-exist beyond the cap, and nothing in the response says so. When the count comes
-back equal to the limit, raise `--limit` or filter with `--state` before
-concluding a job is absent.
+`meta` reports whether the cap hid anything: `count` is what you got, `total` is
+how many matched, and `truncated` is true when `count < total`. Raise `--limit`
+or narrow with `--state` when `truncated` is true — never conclude a job is
+absent from a truncated list.
+
+```json
+{"ok": true, "action": "job-list",
+ "result": {"jobs": [ ], "jobs_dir": "..."},
+ "meta": {"count": 20, "total": 34, "truncated": true, "schema_version": "1.2"}}
+```
 
 ## Choosing a diarization backend
 

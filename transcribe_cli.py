@@ -10,7 +10,8 @@ Envelope:
     {"ok": false, "action": str, "error": {"type": str, "message": str,
                                            "details": {...}}, "meta": {...}}
 
-Exit code is 0 when `ok` is true and 1 when it is false. Run
+Exit code is 0 when `ok` is true, 2 when the call itself was malformed
+(`invalid_arguments`), and 1 for every other failure. Run
 `bin/transcribe list-actions` for the machine-readable action catalog.
 """
 
@@ -25,6 +26,7 @@ import signal
 import subprocess
 import sys
 import time
+import tomllib
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -44,8 +46,16 @@ from transcribe_pipeline.config import (
     resolve_diarization_backend,
 )
 
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
 DEFAULT_TIMEOUT_SECONDS = 7200
+
+# argparse's convention, and the one agents are most likely to assume: a
+# malformed call exits 2, so "you called me wrong" is distinguishable from
+# "the work failed" without parsing stdout.
+USAGE_EXIT_CODE = 2
+FAILURE_EXIT_CODE = 1
+# Only used when pyproject.toml cannot be read; the file is the source of truth.
+FALLBACK_TOOL_VERSION = "0.0.0"
 
 CLI_PATH = Path(__file__).resolve()
 DEFAULT_JOBS_DIR = PROJECT_ROOT / ".transcribe-jobs"
@@ -93,7 +103,25 @@ def _emit(payload: dict, stream=None) -> int:
     """Write the one and only JSON object, then report the process exit code."""
     payload.setdefault("meta", {})["schema_version"] = SCHEMA_VERSION
     print(json.dumps(payload, indent=2, ensure_ascii=False), file=stream or sys.stdout)
-    return 0 if payload.get("ok") else 1
+    if payload.get("ok"):
+        return 0
+    if payload.get("error", {}).get("type") == INVALID_ARGUMENTS:
+        return USAGE_EXIT_CODE
+    return FAILURE_EXIT_CODE
+
+
+def tool_version() -> str:
+    """Read the version from pyproject.toml, which is the single source of truth.
+
+    The package is not installed as distribution metadata — the CLI runs from a
+    checkout — so `importlib.metadata` cannot answer this. Reading the file keeps
+    the reported version from drifting away from the project's declared one.
+    """
+    try:
+        with (PROJECT_ROOT / "pyproject.toml").open("rb") as handle:
+            return str(tomllib.load(handle)["project"]["version"])
+    except (OSError, KeyError, tomllib.TOMLDecodeError):
+        return FALLBACK_TOOL_VERSION
 
 
 @contextlib.contextmanager
@@ -821,15 +849,17 @@ def _job_list_arguments(parser: argparse.ArgumentParser) -> None:
 
 @register("job-list", "List detached runs, newest first.")
 @arguments(_job_list_arguments)
-def action_job_list(args: argparse.Namespace) -> dict:
+def action_job_list(args: argparse.Namespace) -> tuple[dict, dict]:
     if args.limit < 1:
         raise ValueError("--limit must be a positive integer")
 
     root = jobs_root(args.jobs_dir)
     if not root.is_dir():
-        return {"jobs": [], "jobs_dir": str(root)}
+        return {"jobs": [], "jobs_dir": str(root)}, _list_meta(0, 0)
 
-    jobs = []
+    # Every match is collected before the limit is applied: a caller that cannot
+    # see `total` has no way to tell a capped list from a complete one.
+    matches = []
     for directory in sorted(root.iterdir(), reverse=True):
         if not directory.is_dir():
             continue
@@ -839,13 +869,16 @@ def action_job_list(args: argparse.Namespace) -> dict:
             continue
         if args.state and job["state"] != args.state:
             continue
-        jobs.append(
+        matches.append(
             {key: job[key] for key in ("job_id", "state", "phase", "progress", "started_at")}
         )
-        if len(jobs) >= args.limit:
-            break
 
-    return {"jobs": jobs, "jobs_dir": str(root)}
+    jobs = matches[: args.limit]
+    return {"jobs": jobs, "jobs_dir": str(root)}, _list_meta(len(jobs), len(matches))
+
+
+def _list_meta(count: int, total: int) -> dict:
+    return {"count": count, "total": total, "truncated": count < total}
 
 
 def _job_cancel_arguments(parser: argparse.ArgumentParser) -> None:
@@ -903,6 +936,13 @@ def build_parser() -> argparse.ArgumentParser:
         prog="transcribe",
         description="Machine-callable transcription pipeline. stdout is always one JSON object.",
     )
+    # Deliberately not argparse's `action="version"`, which prints bare text to
+    # stdout and would break the one-JSON-object-per-call contract.
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Report the tool and schema versions as a JSON envelope",
+    )
     subparsers = parser.add_subparsers(dest="action", metavar="ACTION")
     for name, action in sorted(ACTIONS.items()):
         subparser = subparsers.add_parser(name, help=action.summary, description=action.summary)
@@ -924,6 +964,19 @@ def main(argv: list[str] | None = None) -> int:
                 INVALID_ARGUMENTS,
                 str(error),
                 {"known_actions": sorted(ACTIONS)},
+            )
+        )
+
+    # Checked before the action requirement: `--version` is a complete call.
+    if args.version:
+        return _emit(
+            _ok(
+                "version",
+                {
+                    "name": "transcribe",
+                    "version": tool_version(),
+                    "schema_version": SCHEMA_VERSION,
+                },
             )
         )
 
