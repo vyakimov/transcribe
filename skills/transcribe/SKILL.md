@@ -30,10 +30,10 @@ allowlist as a single absolute path.
 Progress, model chatter, and subprocess noise go to `stderr` and can be ignored.
 
 ```json
-{"ok": true,  "action": "probe", "result": { }, "meta": {"schema_version": "1.0"}}
+{"ok": true,  "action": "probe", "result": { }, "meta": {"schema_version": "1.1"}}
 {"ok": false, "action": "probe", "error": {"type": "resource_not_found",
                                            "message": "...", "details": { }},
-                                 "meta": {"schema_version": "1.0"}}
+                                 "meta": {"schema_version": "1.1"}}
 ```
 
 Exit code is `0` when `ok` is true, `1` when it is false.
@@ -141,6 +141,19 @@ for reporting, not precise. It never reaches `1.0` while a job is running.
 Job state lives in `.transcribe-jobs/<job_id>/` (`status.json`, `stderr.log`,
 `result.json`). Read `stderr.log` directly when a job fails and you need more
 than the tail in `recent_stderr`.
+
+### Reading job-list
+
+| Flag | Effect |
+| --- | --- |
+| `--limit N` | Maximum jobs returned, newest first. Default `20` |
+| `--state` | Only return jobs in one state: `running`, `succeeded`, `failed`, or `cancelled` |
+| `--jobs-dir DIR` | Where job state lives (default `.transcribe-jobs/`, or `$TRANSCRIBE_JOBS_DIR`) |
+
+The list is **capped silently**: exactly `--limit` entries means older jobs may
+exist beyond the cap, and nothing in the response says so. When the count comes
+back equal to the limit, raise `--limit` or filter with `--state` before
+concluding a job is absent.
 
 ## Choosing a diarization backend
 
