@@ -176,6 +176,55 @@ change the default directory, and `--quiet` to suppress the stdout copy.
 Heavy denoising is deliberately avoided: speech-enhancement artifacts can reduce
 modern ASR accuracy.
 
+## Machine-callable CLI
+
+`transcribe.py` is the human interface. For scripts and agents, `bin/transcribe`
+is a single executable that prints exactly one JSON object to stdout — on success
+and on failure alike — and sends all progress to stderr. It resolves its own
+interpreter, so callers never need `uv run` and the one absolute path can be
+allowlisted.
+
+```bash
+bin/transcribe list-actions                       # machine-readable catalog
+bin/transcribe check-setup                        # tools, credentials, backends
+bin/transcribe probe --audio input/interview.m4a  # duration and size
+bin/transcribe transcribe --audio input/interview.m4a --language en --dry-run
+bin/transcribe transcribe --audio input/interview.m4a --language en
+```
+
+A run takes minutes, so `--detach` starts it in a background process that
+survives the calling shell, returns a `job_id` immediately, and is polled:
+
+```bash
+bin/transcribe transcribe --audio input/interview.m4a --language en --detach
+bin/transcribe job-status --job-id 20260806-173647-de4ad931
+bin/transcribe job-list
+bin/transcribe job-cancel --job-id 20260806-173647-de4ad931
+```
+
+`job-status` reports `state` (`running`, `succeeded`, `failed`, `cancelled`),
+the current `phase` with a coarse `progress` estimate derived from the pipeline's
+own output, and the full result once finished. Note that `ok` describes the poll
+and `result.state` describes the job: polling a failed job succeeds. State lives
+in `.transcribe-jobs/<job_id>/` alongside the job's `stderr.log`.
+
+```json
+{"ok": true,  "action": "probe", "result": {}, "meta": {"schema_version": "1.0"}}
+{"ok": false, "action": "probe", "error": {"type": "resource_not_found",
+                                           "message": "...", "details": {}},
+                                 "meta": {"schema_version": "1.0"}}
+```
+
+Exit status is 0 when `ok` is true and 1 when it is false. Branch on
+`error.type` — the types are stable (`invalid_arguments`, `resource_not_found`,
+`authentication_failed`, `permission_denied`, `timeout`, `upstream_error`,
+`rate_limited`, `conflict`, `dependency_missing`, `internal_error`); the messages
+are not. `--dry-run` validates inputs and reports the plan without calling a paid
+API.
+
+Agent-facing documentation lives in [`skills/`](skills/) and is not tied to any
+one assistant; see [`skills/transcribe/SKILL.md`](skills/transcribe/SKILL.md).
+
 ## Output
 
 The readable transcript groups consecutive segments by speaker:

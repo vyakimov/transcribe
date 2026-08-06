@@ -1,0 +1,47 @@
+#!/bin/sh
+# Single entry point for the transcription pipeline.
+#
+# Resolves the project's own interpreter so callers never need `uv run ...` and
+# can allowlist one absolute path. stdout carries exactly one JSON object;
+# progress and diagnostics go to stderr.
+#
+#   bin/transcribe list-actions
+#   bin/transcribe check-setup
+#   bin/transcribe transcribe --audio input/interview.m4a --language en
+
+set -eu
+
+# Follow symlinks so the executable keeps working when linked onto PATH.
+SCRIPT=$0
+while [ -L "$SCRIPT" ]; do
+    LINK=$(readlink "$SCRIPT")
+    case $LINK in
+        /*) SCRIPT=$LINK ;;
+        *) SCRIPT=$(dirname "$SCRIPT")/$LINK ;;
+    esac
+done
+ROOT=$(cd "$(dirname "$SCRIPT")/.." && pwd)
+CLI="$ROOT/transcribe_cli.py"
+
+fail() {
+    # Even a bootstrap failure must be a parseable envelope.
+    printf '{"ok":false,"action":"%s","error":{"type":"dependency_missing","message":"%s","details":{"project_root":"%s"}},"meta":{"schema_version":"1.0"}}\n' \
+        "${1:-unknown}" "$2" "$ROOT"
+    exit 1
+}
+
+ACTION=${1:-unknown}
+case $ACTION in -*) ACTION=unknown ;; esac
+
+[ -f "$CLI" ] || fail "$ACTION" "transcribe_cli.py is missing from the project root"
+
+if [ -x "$ROOT/.venv/bin/python" ]; then
+    exec "$ROOT/.venv/bin/python" "$CLI" "$@"
+fi
+
+# No prepared environment: fall back to uv so a fresh checkout still works.
+if command -v uv >/dev/null 2>&1; then
+    exec uv run --project "$ROOT" --quiet python "$CLI" "$@"
+fi
+
+fail "$ACTION" "no interpreter found; run 'uv sync' in the project root to create .venv"
