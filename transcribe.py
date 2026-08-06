@@ -7,7 +7,13 @@ import argparse
 import sys
 from pathlib import Path
 
-from transcribe_pipeline.config import DEFAULT_OUTPUT_DIR, load_environment
+from transcribe_pipeline.config import (
+    DEFAULT_OUTPUT_DIR,
+    DIARIZATION_BACKEND_COMMUNITY,
+    DIARIZATION_BACKENDS,
+    load_environment,
+    resolve_diarization_backend,
+)
 from transcribe_pipeline.pipeline import Options, run, write_raw_responses
 from transcribe_pipeline.render import render_json, render_text
 
@@ -41,6 +47,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Known number of speakers, passed to diarization when you know it",
     )
     parser.add_argument("--device", help="Force the alignment device, e.g. cpu or cuda")
+    parser.add_argument(
+        "--diarization-backend",
+        help=(
+            f"Which diarizer to use ({' or '.join(DIARIZATION_BACKENDS)}): 'pyannote' "
+            "is the hosted precision-2 API (default), 'community' runs Community-1 "
+            "locally. Overrides DIARIZATION_BACKEND."
+        ),
+    )
+    parser.add_argument(
+        "--diarization-device",
+        help="Force the local diarization device, e.g. cpu, cuda, or mps (community backend)",
+    )
     parser.add_argument(
         "--no-preprocess",
         action="store_true",
@@ -77,6 +95,14 @@ def main(argv: list[str] | None = None) -> int:
     if not args.audio.is_file():
         parser.error(f"audio file does not exist: {args.audio}")
 
+    backend = resolve_diarization_backend(args.diarization_backend)
+    if args.diarization_device and backend != DIARIZATION_BACKEND_COMMUNITY:
+        print(
+            f"--diarization-device has no effect with the {backend} backend; "
+            "the hosted diarizer runs on pyannoteAI's own hardware.",
+            file=sys.stderr,
+        )
+
     document, raw_responses = run(
         Options(
             audio=args.audio,
@@ -87,6 +113,8 @@ def main(argv: list[str] | None = None) -> int:
             align=not args.no_align,
             clean=not args.no_clean,
             device=args.device,
+            diarization_backend=backend,
+            diarization_device=args.diarization_device,
         )
     )
 

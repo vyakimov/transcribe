@@ -6,7 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from transcribe_pipeline import alignment, asr, cleanup, diarization, media, pipeline
+from transcribe_pipeline import (
+    alignment,
+    asr,
+    cleanup,
+    diarization,
+    local_diarization,
+    media,
+    pipeline,
+)
 from transcribe_pipeline.models import Chunk, DiarizationResult, MediaInfo, Turn, Word
 from transcribe_pipeline.pipeline import Options
 
@@ -27,6 +35,7 @@ def stubbed(monkeypatch, tmp_path):
     """Replace ffmpeg and every hosted call with deterministic stand-ins."""
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
     monkeypatch.setenv("PYANNOTE_API_KEY", "test-pyannote")
+    monkeypatch.delenv("DIARIZATION_BACKEND", raising=False)
 
     state: dict = {
         "chunks": [CHUNK_ONE, CHUNK_TWO],
@@ -34,6 +43,8 @@ def stubbed(monkeypatch, tmp_path):
         "turns": TURNS,
         "words": {0: CHUNK_ONE_WORDS, 1: CHUNK_TWO_WORDS},
         "align_calls": [],
+        "hosted_calls": [],
+        "local_calls": [],
         "cleanup_calls": 0,
     }
 
@@ -52,6 +63,11 @@ def stubbed(monkeypatch, tmp_path):
         ]
 
     def fake_diarize(source, *, api_key, num_speakers=None):
+        state["hosted_calls"].append({"api_key": api_key, "num_speakers": num_speakers})
+        return DiarizationResult(turns=state["turns"])
+
+    def fake_local_diarize(source, *, num_speakers=None, device=None):
+        state["local_calls"].append({"num_speakers": num_speakers, "device": device})
         return DiarizationResult(turns=state["turns"])
 
     def fake_align(audio, requests, *, language=None, device=None):
@@ -67,6 +83,7 @@ def stubbed(monkeypatch, tmp_path):
 
     monkeypatch.setattr(asr, "transcribe_chunks", fake_transcribe)
     monkeypatch.setattr(diarization, "diarize", fake_diarize)
+    monkeypatch.setattr(local_diarization, "diarize", fake_local_diarize)
     monkeypatch.setattr(alignment, "align", fake_align)
     monkeypatch.setattr(cleanup, "clean_segments", fake_clean)
     return state
@@ -163,6 +180,69 @@ class TestSkipFlags:
         assert all(segment.speaker is None for segment in document.segments)
         assert all(segment.start is None for segment in document.segments)
 
+    def test_no_align_bypasses_every_diarization_backend(self, stubbed, monkeypatch):
+        monkeypatch.delenv("PYANNOTE_API_KEY", raising=False)
+
+        for backend in ("pyannote", "community"):
+            document, _ = pipeline.run(
+                options(align=False, clean=False, diarization_backend=backend)
+            )
+
+            assert document.models["diarization"] == "none"
+
+        assert stubbed["hosted_calls"] == []
+        assert stubbed["local_calls"] == []
+
+
+class TestDiarizationBackends:
+    def test_the_hosted_backend_is_used_by_default(self, stubbed):
+        document, _ = pipeline.run(options())
+
+        assert len(stubbed["hosted_calls"]) == 1
+        assert stubbed["local_calls"] == []
+        assert document.models["diarization"] == "precision-2"
+
+    def test_the_community_backend_runs_locally_and_is_recorded(self, stubbed):
+        document, _ = pipeline.run(options(diarization_backend="community"))
+
+        assert len(stubbed["local_calls"]) == 1
+        assert stubbed["hosted_calls"] == []
+        assert document.models["diarization"] == "community-1"
+
+    def test_the_community_backend_keeps_the_rest_of_the_pipeline_intact(self, stubbed):
+        document, _ = pipeline.run(options(diarization_backend="community"))
+
+        attributed = [(segment.raw_text, segment.speaker) for segment in document.segments]
+        assert attributed == [
+            ("a", "SPEAKER_00"),
+            ("b", "SPEAKER_00"),
+            ("c", "SPEAKER_00"),
+            ("d", "SPEAKER_01"),
+        ]
+        assert document.speakers == ["SPEAKER_00", "SPEAKER_01"]
+
+    def test_a_known_speaker_count_reaches_the_local_backend(self, stubbed):
+        pipeline.run(options(diarization_backend="community", speakers=2))
+
+        assert stubbed["local_calls"][0]["num_speakers"] == 2
+
+    def test_the_diarization_device_reaches_the_local_backend(self, stubbed):
+        pipeline.run(options(diarization_backend="community", diarization_device="cuda"))
+
+        assert stubbed["local_calls"][0]["device"] == "cuda"
+
+    def test_the_alignment_device_is_not_confused_with_the_diarization_device(self, stubbed):
+        pipeline.run(options(diarization_backend="community", device="cpu"))
+
+        assert stubbed["local_calls"][0]["device"] is None
+
+    def test_an_unknown_backend_fails_before_any_work_is_done(self, stubbed):
+        with pytest.raises(SystemExit, match="pyannote, community"):
+            pipeline.run(options(diarization_backend="whisper"))
+
+        assert stubbed["hosted_calls"] == []
+        assert stubbed["local_calls"] == []
+
 
 class TestMissingCredentials:
     def test_a_missing_openai_key_fails_with_a_clear_message(self, stubbed, monkeypatch):
@@ -176,6 +256,19 @@ class TestMissingCredentials:
 
         with pytest.raises(SystemExit, match="PYANNOTE_API_KEY"):
             pipeline.run(options())
+
+    def test_the_community_backend_needs_no_pyannote_key(self, stubbed, monkeypatch):
+        monkeypatch.delenv("PYANNOTE_API_KEY", raising=False)
+
+        document, _ = pipeline.run(options(diarization_backend="community"))
+
+        assert document.speakers == ["SPEAKER_00", "SPEAKER_01"]
+
+    def test_the_community_backend_still_needs_the_openai_key(self, stubbed, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        with pytest.raises(SystemExit, match="OPENAI_API_KEY"):
+            pipeline.run(options(diarization_backend="community"))
 
 
 class TestDegradedAlignment:

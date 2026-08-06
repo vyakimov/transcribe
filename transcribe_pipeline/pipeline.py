@@ -10,12 +10,24 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from transcribe_pipeline import alignment, asr, attribution, cleanup, diarization, media
+from transcribe_pipeline import (
+    alignment,
+    asr,
+    attribution,
+    cleanup,
+    diarization,
+    local_diarization,
+    media,
+)
 from transcribe_pipeline.config import (
     CLEANUP_MODEL,
-    DIARIZATION_MODEL,
+    DEFAULT_DIARIZATION_BACKEND,
+    DIARIZATION_BACKEND_COMMUNITY,
+    DIARIZATION_BACKEND_PYANNOTE,
     TRANSCRIBE_MODEL,
+    diarization_model_name,
     require_env,
+    validate_diarization_backend,
 )
 from transcribe_pipeline.models import DiarizationResult, TranscriptDocument, Word
 
@@ -30,6 +42,8 @@ class Options:
     align: bool = True
     clean: bool = True
     device: str | None = None
+    diarization_backend: str = DEFAULT_DIARIZATION_BACKEND
+    diarization_device: str | None = None
 
 
 def _alignment_requests(chunks: list[media.Chunk]) -> list[alignment.AlignmentRequest]:
@@ -51,9 +65,19 @@ def run(options: Options) -> tuple[TranscriptDocument, list[dict]]:
     media.require_ffmpeg()
     warnings: list[str] = []
 
+    backend = validate_diarization_backend(
+        options.diarization_backend, source="the diarization backend"
+    )
+
     openai_key = require_env("OPENAI_API_KEY", purpose="transcription and cleanup")
+    # Only the hosted backend needs an API key, and only when diarization runs at
+    # all. The local backend needs HF_TOKEN just to download the gated model, so
+    # it is left to the worker rather than demanded up front.
+    hosted_diarization = options.align and backend == DIARIZATION_BACKEND_PYANNOTE
     pyannote_key = (
-        require_env("PYANNOTE_API_KEY", purpose="speaker diarization") if options.align else ""
+        require_env("PYANNOTE_API_KEY", purpose="hosted pyannoteAI diarization")
+        if hosted_diarization
+        else ""
     )
     client = OpenAI(api_key=openai_key)
 
@@ -76,9 +100,16 @@ def run(options: Options) -> tuple[TranscriptDocument, list[dict]]:
         words: list[Word] = []
 
         if options.align:
-            diarized = diarization.diarize(
-                source, api_key=pyannote_key, num_speakers=options.speakers
-            )
+            if backend == DIARIZATION_BACKEND_COMMUNITY:
+                diarized = local_diarization.diarize(
+                    source,
+                    num_speakers=options.speakers,
+                    device=options.diarization_device,
+                )
+            else:
+                diarized = diarization.diarize(
+                    source, api_key=pyannote_key, num_speakers=options.speakers
+                )
 
             requests = _alignment_requests(chunks)
             for request, transcript in zip(requests, transcripts):
@@ -124,7 +155,7 @@ def run(options: Options) -> tuple[TranscriptDocument, list[dict]]:
         warnings=warnings,
         models={
             "transcription": TRANSCRIBE_MODEL,
-            "diarization": DIARIZATION_MODEL if options.align else "none",
+            "diarization": diarization_model_name(backend) if options.align else "none",
             "cleanup": CLEANUP_MODEL if options.clean else "none",
         },
         exclusive_turns=diarized.exclusive_turns,

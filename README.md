@@ -1,9 +1,10 @@
 # Hosted transcription with speaker attribution
 
 Transcribes an audio file with OpenAI's `gpt-transcribe`, diarizes it
-independently with pyannoteAI `precision-2`, and reconciles the two with
-WhisperX's wav2vec2 forced aligner. Transcription and diarization never see each
-other's output, so crosstalk cannot duplicate text or silently reassign it.
+independently with pyannoteAI `precision-2` or a local pyannote Community-1, and
+reconciles the two with WhisperX's wav2vec2 forced aligner. Transcription and
+diarization never see each other's output, so crosstalk cannot duplicate text or
+silently reassign it.
 
 ## How it works
 
@@ -16,10 +17,11 @@ other's output, so crosstalk cannot duplicate text or silently reassign it.
 3. **Transcribe** — `gpt-transcribe` runs once per whole chunk. Isolated
    diarization turns are never transcribed separately: that is what makes
    crosstalk duplicate text and swap speakers.
-4. **Diarize** — the whole file goes to pyannoteAI `precision-2` in one job, so
-   speaker labels stay consistent end to end. Regular diarization is canonical
-   because it preserves overlapping speech; the exclusive view is kept in the
-   JSON and used only to break ties the canonical view leaves open.
+4. **Diarize** — the whole file is diarized in one job, so speaker labels stay
+   consistent end to end. Regular diarization is canonical because it preserves
+   overlapping speech; the exclusive view is kept in the JSON and used only to
+   break ties the canonical view leaves open. Two interchangeable backends
+   produce that pair — see [Diarization backends](#diarization-backends).
 5. **Align** — WhisperX's forced aligner (not its ASR) places GPT's words on the
    timeline.
 6. **Attribute** — each word is credited to the diarization speaker(s) active
@@ -33,6 +35,7 @@ other's output, so crosstalk cannot duplicate text or silently reassign it.
 brew install ffmpeg                              # macOS; omit if already installed
 uv sync
 uv run python scripts/setup_alignment.py         # builds the aligner environment
+uv run python scripts/setup_diarization.py       # optional: local diarization
 ```
 
 Put both keys in `.env` at the project root:
@@ -41,6 +44,10 @@ Put both keys in `.env` at the project root:
 OPENAI_API_KEY=sk-...
 PYANNOTE_API_KEY=...
 ```
+
+`PYANNOTE_API_KEY` is only needed by the default hosted diarizer; the local
+backend uses `HF_TOKEN` instead, and neither is needed with `--no-align`. See
+[Diarization backends](#diarization-backends).
 
 `.env` is loaded automatically, so `uv run --env-file .env` is no longer needed.
 Real environment variables always take precedence over `.env`.
@@ -63,6 +70,75 @@ If `.venv-align` is absent, the worker falls back to building a throwaway
 environment on demand with `uv run --no-project --python 3.12 --with whisperx`.
 Set `TRANSCRIBE_ALIGN_CMD` to override the command entirely if you manage that
 environment yourself.
+
+## Diarization backends
+
+Diarization is the only stage with a choice of provider. Both return the same
+regular and exclusive timelines, so everything downstream — alignment,
+attribution, the JSON schema — is identical either way. The backend used is
+recorded in `models.diarization` in the output.
+
+| Backend | Model | Runs | Needs |
+| --- | --- | --- | --- |
+| `pyannote` (default) | `precision-2` | pyannoteAI's API | `PYANNOTE_API_KEY` |
+| `community` | `pyannote/speaker-diarization-community-1` | your machine | one-time model download |
+
+Select it per run or for the whole shell:
+
+```bash
+uv run python transcribe.py input/interview.m4a --diarization-backend community
+DIARIZATION_BACKEND=community uv run python transcribe.py input/interview.m4a
+```
+
+`--diarization-backend` overrides `DIARIZATION_BACKEND`, and an unrecognized
+value in either fails immediately. There is **no automatic fallback between
+backends**: a missing local environment or a missing API key is an error, because
+silently switching would change cost and quality without saying so.
+
+### Setting up the local backend
+
+Community-1 is gated. Accept the conditions on the
+[model card](https://huggingface.co/pyannote/speaker-diarization-community-1),
+create a token at [hf.co/settings/tokens](https://hf.co/settings/tokens), and add
+it to `.env`:
+
+```
+HF_TOKEN=hf_...
+```
+
+Then build the environment once:
+
+```bash
+uv run python scripts/setup_diarization.py
+```
+
+That creates `.venv-diarize` (torch and pyannote.audio, on Python 3.12 for the
+same reason the aligner is) and pre-downloads the model. `HF_TOKEN` is only
+needed to *download* the gated weights; once they are cached, runs work offline
+without it. As with alignment, the worker will build a throwaway environment on
+demand if `.venv-diarize` is missing, and `TRANSCRIBE_DIARIZE_CMD` overrides the
+command entirely.
+
+Local diarization defaults to CPU. Pass `--diarization-device cuda` or
+`--diarization-device mps` to use an accelerator; it is separate from `--device`,
+which selects the *alignment* device.
+
+### Which to use
+
+Community-1 is documented as substantially better than the older open pyannote
+3.1, and it is a true diarizer with an exclusive speaker timeline, so it slots
+into the attribution logic without compromise. Running it yourself has no
+recurring provider bill; hosted Community-1 still sits behind
+[pyannote's monthly plans](https://www.pyannote.ai/pricing). The hosted
+`precision-2` stays the default because it needs no local GPU, no multi-gigabyte
+download, and no model-license acceptance.
+
+Published diarization benchmarks vary substantially by domain, so run both
+against representative audio before committing to one.
+
+OpenAI's `gpt-4o-transcribe-diarize` is deliberately not offered: it is an
+ASR-plus-diarization call, so it would retranscribe the audio rather than
+diarize it independently, at roughly $0.006/minute.
 
 ## Usage
 
@@ -90,9 +166,11 @@ change the default directory, and `--quiet` to suppress the stdout copy.
 | `--language` | ISO-639-1 code; also selects the alignment model |
 | `--speakers` | Known speaker count, passed to diarization |
 | `--device` | Force the alignment device (`cpu`, `cuda`) |
+| `--diarization-backend` | `pyannote` (hosted, default) or `community` (local); overrides `DIARIZATION_BACKEND` |
+| `--diarization-device` | Force the local diarization device (`cpu`, `cuda`, `mps`); `community` only |
 | `--no-denoise` | Keep filtering and normalization, skip noise reduction |
 | `--no-preprocess` | Send the original audio unchanged |
-| `--no-align` | Skip diarization and alignment entirely — no `PYANNOTE_API_KEY` needed, but no speakers or timings either |
+| `--no-align` | Skip diarization and alignment entirely — no diarization credentials needed, but no speakers or timings either |
 | `--no-clean` | Skip the cleanup pass; `clean_text` equals `raw_text` |
 
 Heavy denoising is deliberately avoided: speech-enhancement artifacts can reduce
@@ -139,10 +217,10 @@ Attribution rules, applied per word:
 1. exactly one speaker active → that speaker, `overlap: false`;
 2. several active but one clearly dominant → that speaker, `overlap: true`,
    every candidate retained;
-3. several active with no clear winner → fall back to pyannoteAI's **exclusive**
-   diarization, which names the speaker most likely to be transcribed at that
-   instant. Its answer is accepted only if it is already one of the candidates,
-   so the tiebreaker can narrow an attribution but never invent one;
+3. several active with no clear winner → fall back to the diarizer's
+   **exclusive** timeline, which names the speaker most likely to be transcribed
+   at that instant. Its answer is accepted only if it is already one of the
+   candidates, so the tiebreaker can narrow an attribution but never invent one;
 4. still undecided, no speaker active nearby, or the word could not be
    aligned → `speaker: null` and a warning.
 
@@ -150,8 +228,6 @@ Attribution rules, applied per word:
 never erases the fact that more than one person was talking. The readable
 transcript groups by speaker so a one-word interjection does not chop a sentence
 in half, and reports the overlap count in its header.
-Published diarization benchmarks vary substantially by domain, so representative
-local audio remains the final quality check.
 
 ## Tests
 
@@ -159,7 +235,7 @@ local audio remains the final quality check.
 uv run pytest
 ```
 
-The OpenAI, pyannoteAI, and WhisperX boundaries are mocked independently, so the
-suite runs offline. It covers the synthetic crosstalk case, chunk seams,
-unaligned words, missing diarization, and every way the cleanup pass can be
-rejected.
+The OpenAI, pyannoteAI, Community-1, and WhisperX boundaries are mocked
+independently, so the suite runs offline. It covers the synthetic crosstalk case,
+chunk seams, unaligned words, missing diarization, backend selection, and every
+way the cleanup pass can be rejected.

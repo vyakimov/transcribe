@@ -21,6 +21,24 @@ DIARIZATION_MODEL = "precision-2"
 
 PYANNOTE_API_BASE = "https://api.pyannote.ai/v1"
 
+# Diarization backends. `pyannote` is the hosted pyannoteAI `precision-2` API and
+# stays the default; `community` runs pyannote's open Community-1 pipeline
+# locally. They are never substituted for one another: switching backend changes
+# cost and quality, so a missing setup fails rather than falling back.
+DIARIZATION_BACKEND_PYANNOTE = "pyannote"
+DIARIZATION_BACKEND_COMMUNITY = "community"
+DIARIZATION_BACKENDS = (DIARIZATION_BACKEND_PYANNOTE, DIARIZATION_BACKEND_COMMUNITY)
+DEFAULT_DIARIZATION_BACKEND = DIARIZATION_BACKEND_PYANNOTE
+
+COMMUNITY_MODEL_ID = "pyannote/speaker-diarization-community-1"
+COMMUNITY_DIARIZATION_MODEL = "community-1"
+
+# What each backend records in the output metadata.
+DIARIZATION_MODEL_NAMES = {
+    DIARIZATION_BACKEND_PYANNOTE: DIARIZATION_MODEL,
+    DIARIZATION_BACKEND_COMMUNITY: COMMUNITY_DIARIZATION_MODEL,
+}
+
 # The alignment stage runs out-of-process: whisperx pins torch and declares
 # `requires-python <3.14`, so it cannot be installed alongside this project.
 DEFAULT_ALIGN_PYTHON = "3.12"
@@ -30,12 +48,59 @@ ALIGN_WORKER = PROJECT_ROOT / "workers" / "align_worker.py"
 # which avoids re-resolving whisperx on every run.
 ALIGN_VENV = PROJECT_ROOT / ".venv-align"
 
+# Local diarization runs out-of-process for the same reason: pyannote.audio pulls
+# in torch, which keeps it off this project's Python version. Its environment is
+# separate from the aligner's so neither can perturb the other's torch pin.
+DEFAULT_DIARIZE_PYTHON = "3.12"
+DIARIZE_WORKER = PROJECT_ROOT / "workers" / "diarize_worker.py"
 
-def align_venv_python() -> Path | None:
-    for candidate in (ALIGN_VENV / "bin" / "python", ALIGN_VENV / "Scripts" / "python.exe"):
+# Prepared by `scripts/setup_diarization.py`.
+DIARIZE_VENV = PROJECT_ROOT / ".venv-diarize"
+
+
+def _venv_python(venv: Path) -> Path | None:
+    for candidate in (venv / "bin" / "python", venv / "Scripts" / "python.exe"):
         if candidate.is_file():
             return candidate
     return None
+
+
+def align_venv_python() -> Path | None:
+    return _venv_python(ALIGN_VENV)
+
+
+def diarize_venv_python() -> Path | None:
+    return _venv_python(DIARIZE_VENV)
+
+
+def validate_diarization_backend(value: str | None, *, source: str) -> str:
+    """Normalize a backend name, failing clearly rather than guessing."""
+    normalized = (value or "").strip().lower()
+    if normalized not in DIARIZATION_BACKENDS:
+        raise SystemExit(
+            f"Unknown diarization backend {value!r} from {source}. "
+            f"Choose one of: {', '.join(DIARIZATION_BACKENDS)}."
+        )
+    return normalized
+
+
+def resolve_diarization_backend(cli_value: str | None = None) -> str:
+    """Pick the backend, letting the CLI override `DIARIZATION_BACKEND`."""
+    if cli_value:
+        return validate_diarization_backend(cli_value, source="--diarization-backend")
+
+    from_env = os.environ.get("DIARIZATION_BACKEND", "").strip()
+    if from_env:
+        return validate_diarization_backend(from_env, source="DIARIZATION_BACKEND")
+
+    return DEFAULT_DIARIZATION_BACKEND
+
+
+def diarization_model_name(backend: str) -> str:
+    """The model identifier a backend records in the output metadata."""
+    return DIARIZATION_MODEL_NAMES[
+        validate_diarization_backend(backend, source="the diarization backend")
+    ]
 
 
 def load_environment() -> None:
