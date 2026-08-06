@@ -18,6 +18,9 @@ wheels/
 # Generated transcripts
 output/
 
+# Source recordings — real interviews, kept local and never published
+input/
+
 # Background job state
 .transcribe-jobs/
 .DS_Store
