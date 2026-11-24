@@ -13,6 +13,7 @@ from openai import OpenAI
 from transcribe_pipeline import (
     alignment,
     asr,
+    assemblyai_diarization,
     attribution,
     cleanup,
     diarization,
@@ -21,7 +22,14 @@ from transcribe_pipeline import (
 )
 from transcribe_pipeline.config import (
     CLEANUP_MODEL,
+    ASSEMBLYAI_KEY_VARIABLES,
+    ASSEMBLYAI_TRANSCRIPTION_MODEL,
+    DEFAULT_TRANSCRIPTION_BACKEND,
+    TRANSCRIPTION_BACKEND_ASSEMBLYAI,
+    check_backend_combination,
+    validate_transcription_backend,
     DEFAULT_DIARIZATION_BACKEND,
+    DIARIZATION_BACKEND_ASSEMBLYAI,
     DIARIZATION_BACKEND_COMMUNITY,
     DIARIZATION_BACKEND_PYANNOTE,
     TRANSCRIBE_MODEL,
@@ -42,7 +50,10 @@ class Options:
     align: bool = True
     clean: bool = True
     device: str | None = None
-    diarization_backend: str = DEFAULT_DIARIZATION_BACKEND
+    transcription_backend: str = DEFAULT_TRANSCRIPTION_BACKEND
+    # None means "whatever the transcription backend implies": AssemblyAI's own
+    # speakers with the assemblyai transcriber, the local default with gpt.
+    diarization_backend: str | None = None
     diarization_device: str | None = None
 
 
@@ -61,16 +72,83 @@ def _alignment_requests(chunks: list[media.Chunk]) -> list[alignment.AlignmentRe
     return requests
 
 
+def _assemblyai_key() -> str:
+    return assemblyai_diarization.api_key_from_environment() or require_env(
+        ASSEMBLYAI_KEY_VARIABLES[0], purpose="AssemblyAI transcription and diarization"
+    )
+
+
+def _run_assemblyai(options: Options) -> tuple[TranscriptDocument, list[dict]]:
+    """The single-job path: words, timings, and speakers all come from AssemblyAI.
+
+    The original audio is sent as-is. AssemblyAI does its own audio handling, and
+    its transcript is already punctuated, so preprocessing, chunking, forced
+    alignment, and the cleanup pass have nothing to do here.
+    """
+    api_key = _assemblyai_key()
+    info = media.probe(options.audio)
+    warnings: list[str] = []
+
+    words, diarized, body = assemblyai_diarization.transcribe(
+        options.audio,
+        api_key=api_key,
+        num_speakers=options.speakers,
+        language=options.language,
+        speaker_labels=options.align,
+    )
+    if not options.align:
+        warnings.append(
+            "speaker labels were skipped (--no-align), so no speaker attribution is available"
+        )
+
+    segments = attribution.group_segments(words)
+    unattributed = sum(1 for word in words if word.speaker is None)
+    if options.align and unattributed:
+        warnings.append(f"{unattributed} word(s) came back without a speaker label")
+
+    document = TranscriptDocument(
+        audio=options.audio,
+        duration=info.duration,
+        language=options.language or body.get("language_code"),
+        speakers=diarized.speakers,
+        segments=segments,
+        warnings=warnings,
+        models={
+            "transcription": str(body.get("speech_model_used") or ASSEMBLYAI_TRANSCRIPTION_MODEL),
+            "diarization": (
+                diarization_model_name(DIARIZATION_BACKEND_ASSEMBLYAI) if options.align else "none"
+            ),
+            "cleanup": "none",
+        },
+        exclusive_turns=diarized.exclusive_turns,
+    )
+    return document, [{"chunk": 0, "audio_start": 0.0, "response": body}]
+
+
 def run(options: Options) -> tuple[TranscriptDocument, list[dict]]:
     media.require_ffmpeg()
     warnings: list[str] = []
 
+    transcription = validate_transcription_backend(
+        options.transcription_backend, source="the transcription backend"
+    )
+    if transcription == TRANSCRIPTION_BACKEND_ASSEMBLYAI:
+        if options.diarization_backend is not None:
+            check_backend_combination(
+                transcription,
+                validate_diarization_backend(
+                    options.diarization_backend, source="the diarization backend"
+                ),
+            )
+        return _run_assemblyai(options)
+
     backend = validate_diarization_backend(
-        options.diarization_backend, source="the diarization backend"
+        options.diarization_backend or DEFAULT_DIARIZATION_BACKEND,
+        source="the diarization backend",
     )
 
     openai_key = require_env("OPENAI_API_KEY", purpose="transcription and cleanup")
-    # Only the hosted backend needs an API key, and only when diarization runs at
+    # Only the hosted backends need an API key, and only when diarization runs at
     # all. The local backend needs HF_TOKEN just to download the gated model, so
     # it is left to the worker rather than demanded up front.
     hosted_diarization = options.align and backend == DIARIZATION_BACKEND_PYANNOTE
@@ -79,6 +157,9 @@ def run(options: Options) -> tuple[TranscriptDocument, list[dict]]:
         if hosted_diarization
         else ""
     )
+    assemblyai_key = ""
+    if options.align and backend == DIARIZATION_BACKEND_ASSEMBLYAI:
+        assemblyai_key = _assemblyai_key()
     client = OpenAI(api_key=openai_key)
 
     with tempfile.TemporaryDirectory(prefix="transcribe-") as temporary:
@@ -105,6 +186,13 @@ def run(options: Options) -> tuple[TranscriptDocument, list[dict]]:
                     source,
                     num_speakers=options.speakers,
                     device=options.diarization_device,
+                )
+            elif backend == DIARIZATION_BACKEND_ASSEMBLYAI:
+                diarized = assemblyai_diarization.diarize(
+                    source,
+                    api_key=assemblyai_key,
+                    num_speakers=options.speakers,
+                    language=options.language,
                 )
             else:
                 diarized = diarization.diarize(

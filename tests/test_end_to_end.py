@@ -44,7 +44,7 @@ def test_real_interview_transcribes_and_attributes(fixture: Path):
     if not fixture.is_file():
         pytest.skip(f"fixture not present: {fixture}")
 
-    document, raw_responses = run(Options(audio=fixture, language="en"))
+    document, raw_responses = run(Options(audio=fixture, language="en", transcription_backend="gpt"))
 
     assert document.segments, "no speech was transcribed"
     assert raw_responses, "raw transcription responses were not retained"
@@ -68,7 +68,7 @@ def test_crosstalk_sections_are_flagged_for_inspection(fixture: Path):
     if not fixture.is_file():
         pytest.skip(f"fixture not present: {fixture}")
 
-    document, _ = run(Options(audio=fixture, language="en"))
+    document, _ = run(Options(audio=fixture, language="en", transcription_backend="gpt"))
     overlaps = [segment for segment in document.segments if segment.overlap]
 
     print(f"\n{fixture.name}: {len(overlaps)} overlapping segment(s)")

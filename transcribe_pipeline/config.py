@@ -19,25 +19,48 @@ TRANSCRIBE_MODEL = "gpt-transcribe"
 CLEANUP_MODEL = "gpt-5.6-terra"
 DIARIZATION_MODEL = "precision-2"
 
+# Transcription backends. `assemblyai` is the default: one AssemblyAI job returns
+# the words, their timings, and their speakers together, so no separate
+# diarization, forced alignment, or cleanup pass runs. `gpt` is the original
+# multi-stage path: `gpt-transcribe` for the words, a separate diarizer for the
+# speakers, and WhisperX to put the two on one timeline.
+TRANSCRIPTION_BACKEND_ASSEMBLYAI = "assemblyai"
+TRANSCRIPTION_BACKEND_GPT = "gpt"
+TRANSCRIPTION_BACKENDS = (TRANSCRIPTION_BACKEND_ASSEMBLYAI, TRANSCRIPTION_BACKEND_GPT)
+DEFAULT_TRANSCRIPTION_BACKEND = TRANSCRIPTION_BACKEND_ASSEMBLYAI
+ASSEMBLYAI_TRANSCRIPTION_MODEL = "assemblyai"
+
 PYANNOTE_API_BASE = "https://api.pyannote.ai/v1"
+ASSEMBLYAI_API_BASE = "https://api.assemblyai.com/v2"
+
+# Either name works for the AssemblyAI key; the first one set wins.
+ASSEMBLYAI_KEY_VARIABLES = ("ASSEMBLYAI_API_KEY", "ASSEMBLYAI_KEY")
 
 # Diarization backends. `community` runs pyannote's open Community-1 pipeline
 # locally and is the default: it has no per-minute bill and needs no API key.
-# `pyannote` is the hosted pyannoteAI `precision-2` API. They are never
+# `pyannote` is the hosted pyannoteAI `precision-2` API, and `assemblyai` takes
+# the speaker timeline from AssemblyAI's speaker labels. They are never
 # substituted for one another: switching backend changes cost and quality, so a
 # missing setup fails rather than falling back.
 DIARIZATION_BACKEND_PYANNOTE = "pyannote"
 DIARIZATION_BACKEND_COMMUNITY = "community"
-DIARIZATION_BACKENDS = (DIARIZATION_BACKEND_PYANNOTE, DIARIZATION_BACKEND_COMMUNITY)
+DIARIZATION_BACKEND_ASSEMBLYAI = "assemblyai"
+DIARIZATION_BACKENDS = (
+    DIARIZATION_BACKEND_PYANNOTE,
+    DIARIZATION_BACKEND_COMMUNITY,
+    DIARIZATION_BACKEND_ASSEMBLYAI,
+)
 DEFAULT_DIARIZATION_BACKEND = DIARIZATION_BACKEND_COMMUNITY
 
 COMMUNITY_MODEL_ID = "pyannote/speaker-diarization-community-1"
 COMMUNITY_DIARIZATION_MODEL = "community-1"
+ASSEMBLYAI_DIARIZATION_MODEL = "assemblyai-speaker-labels"
 
 # What each backend records in the output metadata.
 DIARIZATION_MODEL_NAMES = {
     DIARIZATION_BACKEND_PYANNOTE: DIARIZATION_MODEL,
     DIARIZATION_BACKEND_COMMUNITY: COMMUNITY_DIARIZATION_MODEL,
+    DIARIZATION_BACKEND_ASSEMBLYAI: ASSEMBLYAI_DIARIZATION_MODEL,
 }
 
 # The alignment stage runs out-of-process: whisperx pins torch and declares
@@ -106,16 +129,64 @@ def validate_diarization_backend(value: str | None, *, source: str) -> str:
     return normalized
 
 
-def resolve_diarization_backend(cli_value: str | None = None) -> str:
-    """Pick the backend, letting the CLI override `DIARIZATION_BACKEND`."""
+def validate_transcription_backend(value: str | None, *, source: str) -> str:
+    """Normalize a transcription backend name, failing clearly rather than guessing."""
+    normalized = (value or "").strip().lower()
+    if normalized not in TRANSCRIPTION_BACKENDS:
+        raise SystemExit(
+            f"Unknown transcription backend {value!r} from {source}. "
+            f"Choose one of: {', '.join(TRANSCRIPTION_BACKENDS)}."
+        )
+    return normalized
+
+
+def resolve_transcription_backend(cli_value: str | None = None) -> str:
+    """Pick the transcriber, letting the CLI override `TRANSCRIPTION_BACKEND`."""
     if cli_value:
-        return validate_diarization_backend(cli_value, source="--diarization-backend")
+        return validate_transcription_backend(cli_value, source="--transcription-backend")
 
-    from_env = os.environ.get("DIARIZATION_BACKEND", "").strip()
+    from_env = os.environ.get("TRANSCRIPTION_BACKEND", "").strip()
     if from_env:
-        return validate_diarization_backend(from_env, source="DIARIZATION_BACKEND")
+        return validate_transcription_backend(from_env, source="TRANSCRIPTION_BACKEND")
 
-    return DEFAULT_DIARIZATION_BACKEND
+    return DEFAULT_TRANSCRIPTION_BACKEND
+
+
+def check_backend_combination(transcription: str, diarization: str) -> None:
+    """AssemblyAI transcripts carry their own speakers; no other diarizer applies."""
+    if (
+        transcription == TRANSCRIPTION_BACKEND_ASSEMBLYAI
+        and diarization != DIARIZATION_BACKEND_ASSEMBLYAI
+    ):
+        raise SystemExit(
+            f"The {diarization} diarization backend cannot be combined with the "
+            "assemblyai transcription backend, whose transcript already carries "
+            "speaker labels. Choose the gpt transcription backend to use it."
+        )
+
+
+def resolve_diarization_backend(
+    cli_value: str | None = None, *, transcription_backend: str = TRANSCRIPTION_BACKEND_GPT
+) -> str:
+    """Pick the backend, letting the CLI override `DIARIZATION_BACKEND`.
+
+    With the assemblyai transcription backend the speakers come from the same
+    job, so that is the only valid answer and an explicit other choice fails.
+    """
+    chosen: str | None = None
+    if cli_value:
+        chosen = validate_diarization_backend(cli_value, source="--diarization-backend")
+    else:
+        from_env = os.environ.get("DIARIZATION_BACKEND", "").strip()
+        if from_env:
+            chosen = validate_diarization_backend(from_env, source="DIARIZATION_BACKEND")
+
+    if transcription_backend == TRANSCRIPTION_BACKEND_ASSEMBLYAI:
+        if chosen is not None:
+            check_backend_combination(transcription_backend, chosen)
+        return DIARIZATION_BACKEND_ASSEMBLYAI
+
+    return chosen or DEFAULT_DIARIZATION_BACKEND
 
 
 def diarization_model_name(backend: str) -> str:

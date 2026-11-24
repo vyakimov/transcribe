@@ -36,8 +36,19 @@ EXECUTABLE = ROOT / "bin" / "transcribe"
 def isolated_env(monkeypatch):
     """Stop `.env` from leaking real credentials into credential tests."""
     monkeypatch.setattr(transcribe_cli, "load_environment", lambda: None)
-    for name in ("OPENAI_API_KEY", "PYANNOTE_API_KEY", "HF_TOKEN", "DIARIZATION_BACKEND"):
+    for name in (
+        "OPENAI_API_KEY",
+        "PYANNOTE_API_KEY",
+        "HF_TOKEN",
+        "ASSEMBLYAI_API_KEY",
+        "ASSEMBLYAI_KEY",
+        "DIARIZATION_BACKEND",
+        "TRANSCRIPTION_BACKEND",
+    ):
         monkeypatch.delenv(name, raising=False)
+    # Most of these tests exercise the multi-stage gpt path; the ones about the
+    # assemblyai default remove this again.
+    monkeypatch.setenv("TRANSCRIPTION_BACKEND", "gpt")
 
 
 def invoke(capfd, argv: list[str]) -> tuple[int, dict, str]:
@@ -144,7 +155,7 @@ class TestListActions:
         params = {p["name"]: p for p in action["parameters"]}
 
         assert params["audio"]["required"] is True
-        assert params["diarization_backend"]["choices"] == ["pyannote", "community"]
+        assert params["diarization_backend"]["choices"] == ["pyannote", "community", "assemblyai"]
         assert params["audio"]["description"]
 
     def test_the_error_catalog_is_published(self, capfd):
@@ -328,6 +339,40 @@ class TestCheckSetup:
         assert backends["community"]["ready"] is False
         assert backends["community"]["model"] == "community-1"
         assert any("setup_diarization" in b for b in backends["community"]["blockers"])
+        assert backends["assemblyai"]["ready"] is False
+        assert backends["assemblyai"]["blockers"] == ["ASSEMBLYAI_API_KEY is not set"]
+
+    @pytest.mark.parametrize("variable", ["ASSEMBLYAI_API_KEY", "ASSEMBLYAI_KEY"])
+    def test_either_assemblyai_key_name_makes_its_backend_ready(
+        self, capfd, isolated_env, monkeypatch, variable
+    ):
+        monkeypatch.setenv(variable, "aai-secret-value")
+
+        _, payload, _ = invoke(capfd, ["check-setup"])
+
+        assert payload["result"]["diarization_backends"]["assemblyai"]["ready"] is True
+        assert payload["result"]["credentials"]["ASSEMBLYAI_API_KEY"] is True
+        assert "aai-secret-value" not in json.dumps(payload)
+
+    def test_readiness_follows_the_default_transcription_backend(
+        self, capfd, isolated_env, monkeypatch
+    ):
+        monkeypatch.delenv("TRANSCRIPTION_BACKEND")
+        monkeypatch.setattr(transcribe_cli, "align_venv_python", lambda: None)
+
+        _, payload, _ = invoke(capfd, ["check-setup"])
+        result = payload["result"]
+        assert result["default_transcription_backend"] == "assemblyai"
+        assert result["default_diarization_backend"] == "assemblyai"
+        assert any("ASSEMBLYAI_API_KEY" in blocker for blocker in result["blockers"])
+        assert not any("OPENAI_API_KEY" in blocker for blocker in result["blockers"])
+
+        monkeypatch.setenv("ASSEMBLYAI_API_KEY", "aai-x")
+        _, payload, _ = invoke(capfd, ["check-setup"])
+        result = payload["result"]
+        assert result["transcription_backends"]["assemblyai"]["ready"] is True
+        assert result["transcription_backends"]["gpt"]["ready"] is False
+        assert not any("ASSEMBLYAI" in blocker for blocker in result["blockers"])
 
     def test_a_ready_setup_has_no_blockers(self, capfd, isolated_env, monkeypatch, tmp_path):
         monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
@@ -389,6 +434,63 @@ class TestDryRun:
         assert payload["result"]["would_run"] is False
         assert "OPENAI_API_KEY" in payload["result"]["missing_requirements"]
         assert "PYANNOTE_API_KEY" in payload["result"]["missing_requirements"]
+
+    def test_the_default_dry_run_plans_a_single_assemblyai_job(
+        self, capfd, isolated_env, fake_media, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("TRANSCRIPTION_BACKEND")
+        audio = tmp_path / "a.m4a"
+        audio.write_bytes(b"x")
+
+        _, payload, _ = invoke(capfd, ["transcribe", "--audio", str(audio), "--dry-run"])
+        result = payload["result"]
+
+        assert result["transcription_backend"] == "assemblyai"
+        assert result["diarization_backend"] == "assemblyai"
+        assert result["models"] == {
+            "transcription": "assemblyai",
+            "diarization": "assemblyai-speaker-labels",
+            "cleanup": "none",
+        }
+        # No OpenAI key and no local environment are needed on this path.
+        assert result["missing_requirements"] == ["ASSEMBLYAI_API_KEY"]
+
+        monkeypatch.setenv("ASSEMBLYAI_KEY", "aai-x")
+        _, payload, _ = invoke(capfd, ["transcribe", "--audio", str(audio), "--dry-run"])
+        assert payload["result"]["would_run"] is True
+
+    def test_the_default_transcriber_rejects_another_diarizer(
+        self, capfd, isolated_env, fake_media, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("TRANSCRIPTION_BACKEND")
+        audio = tmp_path / "a.m4a"
+        audio.write_bytes(b"x")
+
+        code, payload, _ = invoke(
+            capfd,
+            ["transcribe", "--audio", str(audio), "--diarization-backend", "community",
+             "--dry-run"],
+        )
+
+        assert code != 0 and payload["ok"] is False
+        assert payload["error"]["type"] == "invalid_arguments"
+        assert "cannot be combined" in payload["error"]["message"]
+
+    def test_a_dry_run_on_assemblyai_wants_its_key(
+        self, capfd, isolated_env, fake_media, tmp_path
+    ):
+        audio = tmp_path / "a.m4a"
+        audio.write_bytes(b"x")
+
+        _, payload, _ = invoke(
+            capfd,
+            ["transcribe", "--audio", str(audio), "--diarization-backend", "assemblyai",
+             "--dry-run"],
+        )
+
+        assert payload["result"]["diarization_backend"] == "assemblyai"
+        assert payload["result"]["models"]["diarization"] == "assemblyai-speaker-labels"
+        assert "ASSEMBLYAI_API_KEY" in payload["result"]["missing_requirements"]
 
     def test_a_dry_run_on_the_local_backend_wants_the_environment(
         self, capfd, isolated_env, fake_media, monkeypatch, tmp_path

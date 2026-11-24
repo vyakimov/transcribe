@@ -11,8 +11,11 @@ from transcribe_pipeline.config import (
     DEFAULT_OUTPUT_DIR,
     DIARIZATION_BACKEND_COMMUNITY,
     DIARIZATION_BACKENDS,
+    TRANSCRIPTION_BACKEND_ASSEMBLYAI,
+    TRANSCRIPTION_BACKENDS,
     load_environment,
     resolve_diarization_backend,
+    resolve_transcription_backend,
 )
 from transcribe_pipeline.pipeline import Options, run, write_raw_responses
 from transcribe_pipeline.render import render_json, render_text
@@ -48,11 +51,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", help="Force the alignment device, e.g. cpu or cuda")
     parser.add_argument(
+        "--transcription-backend",
+        help=(
+            f"Which transcriber to use ({', '.join(TRANSCRIPTION_BACKENDS)}): "
+            "'assemblyai' (default) gets words, timings, and speakers from one "
+            "AssemblyAI job; 'gpt' uses gpt-transcribe with a separate diarizer, "
+            "forced alignment, and cleanup. Overrides TRANSCRIPTION_BACKEND."
+        ),
+    )
+    parser.add_argument(
         "--diarization-backend",
         help=(
-            f"Which diarizer to use ({' or '.join(DIARIZATION_BACKENDS)}): 'community' "
+            "With --transcription-backend gpt only. "
+            f"Which diarizer to use ({', '.join(DIARIZATION_BACKENDS)}): 'community' "
             "runs Community-1 locally (default), 'pyannote' is the hosted "
-            "precision-2 API. Overrides DIARIZATION_BACKEND."
+            "precision-2 API, 'assemblyai' uses AssemblyAI speaker labels. "
+            "Overrides DIARIZATION_BACKEND."
         ),
     )
     parser.add_argument(
@@ -95,11 +109,22 @@ def main(argv: list[str] | None = None) -> int:
     if not args.audio.is_file():
         parser.error(f"audio file does not exist: {args.audio}")
 
-    backend = resolve_diarization_backend(args.diarization_backend)
+    transcription = resolve_transcription_backend(args.transcription_backend)
+    backend = resolve_diarization_backend(
+        args.diarization_backend, transcription_backend=transcription
+    )
+    if transcription == TRANSCRIPTION_BACKEND_ASSEMBLYAI and (
+        args.no_preprocess or args.no_denoise or args.no_clean or args.device
+    ):
+        print(
+            "Preprocessing, cleanup, and alignment options have no effect with the "
+            "assemblyai transcription backend, which runs none of those stages.",
+            file=sys.stderr,
+        )
     if args.diarization_device and backend != DIARIZATION_BACKEND_COMMUNITY:
         print(
             f"--diarization-device has no effect with the {backend} backend; "
-            "the hosted diarizer runs on pyannoteAI's own hardware.",
+            "hosted diarizers run on the provider's own hardware.",
             file=sys.stderr,
         )
 
@@ -113,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
             align=not args.no_align,
             clean=not args.no_clean,
             device=args.device,
+            transcription_backend=transcription,
             diarization_backend=backend,
             diarization_device=args.diarization_device,
         )

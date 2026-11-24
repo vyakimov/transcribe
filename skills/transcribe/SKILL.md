@@ -10,9 +10,13 @@ license: same as the containing repository
 A machine-callable pipeline that turns an audio file into a speaker-attributed,
 timestamped, punctuation-cleaned transcript.
 
-Transcription and diarization run **independently** and are reconciled by forced
-alignment. Neither sees the other's output, so overlapping speech cannot
-duplicate text or silently swap speakers.
+By default one AssemblyAI job supplies words, timings, and speakers
+(`--transcription-backend assemblyai`): it needs only `ASSEMBLYAI_API_KEY`, takes
+well under a minute per hour of audio, labels speakers `SPEAKER_A`, `SPEAKER_B`,
+…, and keeps filler words. `--transcription-backend gpt` selects the older
+multi-stage path, where `gpt-transcribe` and a separate diarizer run
+independently and are reconciled by forced alignment, followed by a punctuation
+cleanup pass. Use `gpt` only when asked for by name.
 
 ## The one command
 
@@ -89,7 +93,8 @@ Key parameters (`--audio` is required):
 | `--audio PATH` | Input audio file |
 | `--language CODE` | ISO-639-1, e.g. `en`. Also selects the alignment model. Pass it when known — it improves accuracy |
 | `--speakers N` | Known speaker count, if you have it |
-| `--diarization-backend` | `community` (local, default) or `pyannote` (hosted) |
+| `--transcription-backend` | `assemblyai` (default) or `gpt` |
+| `--diarization-backend` | `gpt` transcription only; any other value is rejected with the default transcriber. `community` (local, default), `pyannote` (hosted), or `assemblyai` (hosted) |
 | `--diarization-device` | `cpu` (default), `cuda`, or `mps` — local backend only |
 | `--output-dir DIR` | Where the three output files land |
 | `--include-text` | Also return the readable transcript inline in `result.transcript` |
@@ -181,12 +186,17 @@ absent from a truncated list.
 
 ## Choosing a diarization backend
 
-| | `community` (default) | `pyannote` |
-| --- | --- | --- |
-| Runs on | this machine | pyannoteAI's API |
-| Needs | `.venv-diarize` built once | `PYANNOTE_API_KEY` |
-| Per-run cost | none | billed by pyannoteAI |
-| First-run setup | ~1 GB download, gated model | none |
+Only relevant with `--transcription-backend gpt`.
+
+| | `community` (default) | `pyannote` | `assemblyai` |
+| --- | --- | --- | --- |
+| Runs on | this machine | pyannoteAI's API | AssemblyAI's API |
+| Needs | `.venv-diarize` built once | `PYANNOTE_API_KEY` | `ASSEMBLYAI_API_KEY` or `ASSEMBLYAI_KEY` |
+| Per-run cost | none | billed by pyannoteAI | billed by AssemblyAI |
+| First-run setup | ~1 GB download, gated model | none | none |
+
+`assemblyai` labels speakers `SPEAKER_A`, `SPEAKER_B`, … and never marks
+overlapping speech. Use it only when asked for by name.
 
 They are **not** interchanged automatically. If the selected backend is not
 ready, the call fails rather than quietly switching — switching would change
@@ -214,9 +224,10 @@ decision, not a quality one. Verify on your own audio before committing.
 | `dependency_missing` | A tool or environment is absent | Run the setup step the message names |
 | `internal_error` | Unexpected failure | Report it with `details.exception` |
 
-Credentials live in `.env` at the repository root: `OPENAI_API_KEY` always,
-`PYANNOTE_API_KEY` for the hosted backend, `HF_TOKEN` only to download the local
-model the first time. `check-setup` reports which are present and never prints
+Credentials live in `.env` at the repository root: `ASSEMBLYAI_API_KEY` (or
+`ASSEMBLYAI_KEY`) for the default transcriber; `OPENAI_API_KEY` for the `gpt`
+path, plus `PYANNOTE_API_KEY` for its `pyannote` backend and `HF_TOKEN` only to
+download the local model the first time. `check-setup` reports which are present and never prints
 their values.
 
 ## Rules

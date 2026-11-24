@@ -9,6 +9,7 @@ import pytest
 from transcribe_pipeline import (
     alignment,
     asr,
+    assemblyai_diarization,
     cleanup,
     diarization,
     local_diarization,
@@ -36,6 +37,8 @@ def stubbed(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
     monkeypatch.setenv("PYANNOTE_API_KEY", "test-pyannote")
     monkeypatch.delenv("DIARIZATION_BACKEND", raising=False)
+    for name in ("ASSEMBLYAI_API_KEY", "ASSEMBLYAI_KEY"):
+        monkeypatch.delenv(name, raising=False)
 
     state: dict = {
         "chunks": [CHUNK_ONE, CHUNK_TWO],
@@ -45,6 +48,8 @@ def stubbed(monkeypatch, tmp_path):
         "align_calls": [],
         "hosted_calls": [],
         "local_calls": [],
+        "assemblyai_calls": [],
+        "assemblyai_transcribe_calls": [],
         "cleanup_calls": 0,
     }
 
@@ -65,6 +70,38 @@ def stubbed(monkeypatch, tmp_path):
     def fake_diarize(source, *, api_key, num_speakers=None):
         state["hosted_calls"].append({"api_key": api_key, "num_speakers": num_speakers})
         return DiarizationResult(turns=state["turns"])
+
+    def fake_assemblyai_diarize(source, *, api_key, num_speakers=None, language=None):
+        state["assemblyai_calls"].append(
+            {"api_key": api_key, "num_speakers": num_speakers, "language": language}
+        )
+        return DiarizationResult(turns=state["turns"])
+
+    monkeypatch.setattr(assemblyai_diarization, "diarize", fake_assemblyai_diarize)
+
+    def fake_assemblyai_transcribe(
+        source, *, api_key, num_speakers=None, language=None, speaker_labels=True
+    ):
+        state["assemblyai_transcribe_calls"].append(
+            {
+                "source": source,
+                "api_key": api_key,
+                "num_speakers": num_speakers,
+                "language": language,
+                "speaker_labels": speaker_labels,
+            }
+        )
+        speaker = (lambda name: name) if speaker_labels else (lambda name: None)
+        words = [
+            Word("hello", 0.0, 0.4, speaker=speaker("SPEAKER_A")),
+            Word("there", 0.5, 0.9, speaker=speaker("SPEAKER_A")),
+            Word("hi", 1.2, 1.5, speaker=speaker("SPEAKER_B")),
+        ]
+        turns = (Turn("SPEAKER_A", 0.0, 0.9), Turn("SPEAKER_B", 1.2, 1.5)) if speaker_labels else ()
+        body = {"speech_model_used": "aai-model", "language_code": "en"}
+        return words, DiarizationResult(turns=turns, exclusive_turns=turns), body
+
+    monkeypatch.setattr(assemblyai_diarization, "transcribe", fake_assemblyai_transcribe)
 
     def fake_local_diarize(source, *, num_speakers=None, device=None):
         state["local_calls"].append({"num_speakers": num_speakers, "device": device})
@@ -90,7 +127,11 @@ def stubbed(monkeypatch, tmp_path):
 
 
 def options(**overrides) -> Options:
-    defaults = dict(audio=Path("input/interview.m4a"), language="en")
+    # These tests cover the multi-stage gpt path; TestAssemblyAITranscription
+    # covers the single-job default.
+    defaults = dict(
+        audio=Path("input/interview.m4a"), language="en", transcription_backend="gpt"
+    )
     defaults.update(overrides)
     return Options(**defaults)
 
@@ -209,6 +250,20 @@ class TestDiarizationBackends:
         assert stubbed["local_calls"] == []
         assert document.models["diarization"] == "precision-2"
 
+    @pytest.mark.parametrize("variable", ["ASSEMBLYAI_API_KEY", "ASSEMBLYAI_KEY"])
+    def test_the_assemblyai_backend_runs_remotely_and_is_recorded(
+        self, stubbed, monkeypatch, variable
+    ):
+        monkeypatch.setenv(variable, "test-assemblyai")
+
+        document, _ = pipeline.run(options(diarization_backend="assemblyai", speakers=2))
+
+        assert stubbed["assemblyai_calls"] == [
+            {"api_key": "test-assemblyai", "num_speakers": 2, "language": "en"}
+        ]
+        assert stubbed["hosted_calls"] == [] and stubbed["local_calls"] == []
+        assert document.models["diarization"] == "assemblyai-speaker-labels"
+
     def test_the_community_backend_keeps_the_rest_of_the_pipeline_intact(self, stubbed):
         document, _ = pipeline.run(options(diarization_backend="community"))
 
@@ -237,7 +292,7 @@ class TestDiarizationBackends:
         assert stubbed["local_calls"][0]["device"] is None
 
     def test_an_unknown_backend_fails_before_any_work_is_done(self, stubbed):
-        with pytest.raises(SystemExit, match="pyannote, community"):
+        with pytest.raises(SystemExit, match="pyannote, community, assemblyai"):
             pipeline.run(options(diarization_backend="whisper"))
 
         assert stubbed["hosted_calls"] == []
@@ -256,6 +311,12 @@ class TestMissingCredentials:
 
         with pytest.raises(SystemExit, match="PYANNOTE_API_KEY"):
             pipeline.run(options(diarization_backend="pyannote"))
+
+    def test_a_missing_assemblyai_key_names_the_variable(self, stubbed):
+        with pytest.raises(SystemExit, match="ASSEMBLYAI_API_KEY"):
+            pipeline.run(options(diarization_backend="assemblyai"))
+
+        assert stubbed["assemblyai_calls"] == []
 
     def test_the_community_backend_needs_no_pyannote_key(self, stubbed, monkeypatch):
         monkeypatch.delenv("PYANNOTE_API_KEY", raising=False)
@@ -287,3 +348,57 @@ class TestDegradedAlignment:
         document, _ = pipeline.run(options(clean=False))
 
         assert any("could not be attributed" in warning for warning in document.warnings)
+
+
+class TestAssemblyAITranscription:
+    """The default path: one AssemblyAI job supplies words, timings, and speakers."""
+
+    def _options(self, **overrides) -> Options:
+        return Options(**{"audio": Path("input/interview.m4a"), **overrides})
+
+    def test_it_is_the_default_and_needs_no_other_stage(self, stubbed, monkeypatch):
+        monkeypatch.setenv("ASSEMBLYAI_KEY", "test-assemblyai")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        document, raw = pipeline.run(self._options(speakers=2))
+
+        call = stubbed["assemblyai_transcribe_calls"][0]
+        assert call["api_key"] == "test-assemblyai" and call["num_speakers"] == 2
+        # The original recording is sent, not a preprocessed copy.
+        assert call["source"] == Path("input/interview.m4a")
+        assert stubbed["align_calls"] == [] and stubbed["cleanup_calls"] == 0
+        assert stubbed["local_calls"] == [] and stubbed["hosted_calls"] == []
+        assert [(s.speaker, s.raw_text) for s in document.segments] == [
+            ("SPEAKER_A", "hello there"),
+            ("SPEAKER_B", "hi"),
+        ]
+        assert document.speakers == ["SPEAKER_A", "SPEAKER_B"]
+        assert document.language == "en"
+        assert document.models == {
+            "transcription": "aai-model",
+            "diarization": "assemblyai-speaker-labels",
+            "cleanup": "none",
+        }
+        assert raw[0]["response"]["speech_model_used"] == "aai-model"
+
+    def test_no_align_skips_the_speaker_labels(self, stubbed, monkeypatch):
+        monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-assemblyai")
+
+        document, _ = pipeline.run(self._options(align=False))
+
+        assert stubbed["assemblyai_transcribe_calls"][0]["speaker_labels"] is False
+        assert document.speakers == []
+        assert document.models["diarization"] == "none"
+        assert any("--no-align" in warning for warning in document.warnings)
+
+    def test_a_missing_key_names_the_variable(self, stubbed):
+        with pytest.raises(SystemExit, match="ASSEMBLYAI_API_KEY"):
+            pipeline.run(self._options())
+
+    def test_another_diarizer_cannot_be_combined_with_it(self, stubbed, monkeypatch):
+        monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-assemblyai")
+
+        with pytest.raises(SystemExit, match="cannot be combined"):
+            pipeline.run(self._options(diarization_backend="community"))
+
+        assert stubbed["assemblyai_transcribe_calls"] == []

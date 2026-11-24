@@ -35,9 +35,15 @@ from typing import Callable
 
 from transcribe_pipeline.config import (
     DEFAULT_OUTPUT_DIR,
+    ASSEMBLYAI_KEY_VARIABLES,
+    DIARIZATION_BACKEND_ASSEMBLYAI,
     DIARIZATION_BACKEND_COMMUNITY,
     DIARIZATION_BACKEND_PYANNOTE,
     DIARIZATION_BACKENDS,
+    TRANSCRIPTION_BACKEND_ASSEMBLYAI,
+    TRANSCRIPTION_BACKEND_GPT,
+    TRANSCRIPTION_BACKENDS,
+    resolve_transcription_backend,
     PROJECT_ROOT,
     align_venv,
     align_venv_python,
@@ -191,6 +197,7 @@ PHASE_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"Diarizing"), "diarize"),
     (re.compile(r"Loading pyannote/"), "diarize"),
     (re.compile(r"Transcribing chunk (\d+)/(\d+)"), "transcribe"),
+    (re.compile(r"Transcribing with AssemblyAI|AssemblyAI job"), "transcribe"),
     (re.compile(r"Chunking "), "chunk"),
     (re.compile(r"Preprocessing audio"), "preprocess"),
 ]
@@ -426,7 +433,7 @@ def _classify(error: BaseException) -> tuple[str, str, dict]:
             return DEPENDENCY_MISSING, text, details
         if "API_KEY" in text or "TOKEN" in text:
             return AUTHENTICATION_FAILED, text, details
-        if "diarization backend" in text:
+        if "diarization backend" in text or "transcription backend" in text:
             return INVALID_ARGUMENTS, text, details
         return INTERNAL_ERROR, text or "the pipeline exited", details
 
@@ -530,6 +537,10 @@ def _credential(name: str) -> bool:
     return bool(os.environ.get(name, "").strip())
 
 
+def _assemblyai_credential() -> bool:
+    return any(_credential(name) for name in ASSEMBLYAI_KEY_VARIABLES)
+
+
 @register("check-setup", "Report which tools, environments, and credentials are available.")
 def action_check_setup(args: argparse.Namespace) -> dict:
     import shutil
@@ -543,6 +554,8 @@ def action_check_setup(args: argparse.Namespace) -> dict:
         "OPENAI_API_KEY": _credential("OPENAI_API_KEY"),
         "PYANNOTE_API_KEY": _credential("PYANNOTE_API_KEY"),
         "HF_TOKEN": _credential("HF_TOKEN"),
+        # Reported under the canonical name; ASSEMBLYAI_KEY is accepted too.
+        "ASSEMBLYAI_API_KEY": _assemblyai_credential(),
     }
 
     backends = {
@@ -563,15 +576,43 @@ def action_check_setup(args: argparse.Namespace) -> dict:
                 else [f"run scripts/setup_diarization.py to build {diarize_venv()}"]
             ),
         },
+        DIARIZATION_BACKEND_ASSEMBLYAI: {
+            "ready": credentials["ASSEMBLYAI_API_KEY"],
+            "model": diarization_model_name(DIARIZATION_BACKEND_ASSEMBLYAI),
+            "requires": ["ASSEMBLYAI_API_KEY"],
+            "blockers": (
+                [] if credentials["ASSEMBLYAI_API_KEY"] else ["ASSEMBLYAI_API_KEY is not set"]
+            ),
+        },
     }
 
+    gpt_blockers: list[str] = []
+    if not credentials["OPENAI_API_KEY"]:
+        gpt_blockers.append("OPENAI_API_KEY is not set")
+    if align_python is None:
+        gpt_blockers.append(f"run scripts/setup_alignment.py to build {align_venv()}")
+    assemblyai_blockers = (
+        [] if credentials["ASSEMBLYAI_API_KEY"] else ["ASSEMBLYAI_API_KEY is not set"]
+    )
+    transcription_backends = {
+        TRANSCRIPTION_BACKEND_ASSEMBLYAI: {
+            "ready": not assemblyai_blockers,
+            "requires": ["ASSEMBLYAI_API_KEY"],
+            "blockers": assemblyai_blockers,
+        },
+        TRANSCRIPTION_BACKEND_GPT: {
+            "ready": not gpt_blockers,
+            "requires": ["OPENAI_API_KEY", str(align_venv())],
+            "blockers": gpt_blockers,
+        },
+    }
+    default_transcription = resolve_transcription_backend(None)
+
+    # Overall readiness is that of the backend a plain `transcribe` would use.
     blockers: list[str] = []
     if not tools["ffmpeg"] or not tools["ffprobe"]:
         blockers.append("install ffmpeg (provides ffmpeg and ffprobe)")
-    if not credentials["OPENAI_API_KEY"]:
-        blockers.append("OPENAI_API_KEY is not set")
-    if align_python is None:
-        blockers.append(f"run scripts/setup_alignment.py to build {align_venv()}")
+    blockers.extend(transcription_backends[default_transcription]["blockers"])
 
     return {
         "ready": not blockers,
@@ -584,8 +625,12 @@ def action_check_setup(args: argparse.Namespace) -> dict:
             "diarize": {"path": str(diarize_python) if diarize_python else None,
                         "present": diarize_python is not None},
         },
+        "transcription_backends": transcription_backends,
+        "default_transcription_backend": default_transcription,
         "diarization_backends": backends,
-        "default_diarization_backend": resolve_diarization_backend(None),
+        "default_diarization_backend": resolve_diarization_backend(
+            None, transcription_backend=default_transcription
+        ),
         "project_root": str(PROJECT_ROOT),
     }
 
@@ -627,9 +672,21 @@ def _transcribe_arguments(parser: argparse.ArgumentParser) -> None:
         "--speakers", type=int, help="Known speaker count, forwarded to diarization"
     )
     parser.add_argument(
+        "--transcription-backend",
+        choices=list(TRANSCRIPTION_BACKENDS),
+        help=(
+            "assemblyai (default): one AssemblyAI job supplies words, timings, and "
+            "speakers. gpt: gpt-transcribe plus a separate diarizer, alignment, and cleanup"
+        ),
+    )
+    parser.add_argument(
         "--diarization-backend",
         choices=list(DIARIZATION_BACKENDS),
-        help="community (local Community-1, default) or pyannote (hosted precision-2)",
+        help=(
+            "Only chosen with --transcription-backend gpt: community (local "
+            "Community-1, default), pyannote (hosted precision-2), or assemblyai "
+            "(hosted AssemblyAI speaker labels)"
+        ),
     )
     parser.add_argument(
         "--diarization-device", help="Device for local diarization: cpu, cuda, or mps"
@@ -700,7 +757,11 @@ def action_transcribe(args: argparse.Namespace) -> dict:
     if args.timeout_seconds < 0:
         raise ValueError("--timeout-seconds must not be negative")
 
-    backend = resolve_diarization_backend(args.diarization_backend)
+    transcription = resolve_transcription_backend(args.transcription_backend)
+    single_job = transcription == TRANSCRIPTION_BACKEND_ASSEMBLYAI
+    backend = resolve_diarization_backend(
+        args.diarization_backend, transcription_backend=transcription
+    )
 
     # A dry run answers in milliseconds, so detaching it would only add a poll.
     if args.detach and not args.dry_run:
@@ -725,11 +786,12 @@ def action_transcribe(args: argparse.Namespace) -> dict:
 
     planned = {
         "audio": str(audio),
+        "transcription_backend": transcription,
         "diarization_backend": backend if align else None,
         "models": {
-            "transcription": "gpt-transcribe",
+            "transcription": "assemblyai" if single_job else "gpt-transcribe",
             "diarization": diarization_model_name(backend) if align else "none",
-            "cleanup": "none" if args.no_clean else "gpt-5.6-terra",
+            "cleanup": "none" if args.no_clean or single_job else "gpt-5.6-terra",
         },
         "outputs": {
             "json": str(json_path),
@@ -742,12 +804,21 @@ def action_transcribe(args: argparse.Namespace) -> dict:
         media.require_ffmpeg()
         info = media.probe(audio)
         missing: list[str] = []
-        if not _credential("OPENAI_API_KEY"):
+        if not single_job and not _credential("OPENAI_API_KEY"):
             missing.append("OPENAI_API_KEY")
+        if single_job and not _assemblyai_credential():
+            missing.append("ASSEMBLYAI_API_KEY")
         if align and backend == DIARIZATION_BACKEND_PYANNOTE and not _credential(
             "PYANNOTE_API_KEY"
         ):
             missing.append("PYANNOTE_API_KEY")
+        if (
+            not single_job
+            and align
+            and backend == DIARIZATION_BACKEND_ASSEMBLYAI
+            and not _assemblyai_credential()
+        ):
+            missing.append("ASSEMBLYAI_API_KEY")
         # TRANSCRIBE_DIARIZE_CMD supplies the worker command directly, which is
         # how the container image points at its own environment. When it is set
         # there is no `.venv-diarize` to look for.
@@ -780,6 +851,7 @@ def action_transcribe(args: argparse.Namespace) -> dict:
         align=align,
         clean=not args.no_clean,
         device=args.align_device,
+        transcription_backend=transcription,
         diarization_backend=backend,
         diarization_device=args.diarization_device,
     )

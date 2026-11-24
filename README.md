@@ -1,5 +1,25 @@
 # Hosted transcription with speaker attribution
 
+There are two transcription backends, chosen with `--transcription-backend` or
+`TRANSCRIPTION_BACKEND`:
+
+- **`assemblyai` (default)** — one [AssemblyAI](https://www.assemblyai.com) job
+  returns the words, their timings, and their speakers together. The original
+  audio is uploaded as-is; no preprocessing, chunking, separate diarization,
+  forced alignment, or cleanup pass runs, so it needs only `ASSEMBLYAI_API_KEY`
+  (or `ASSEMBLYAI_KEY`) and finishes in well under a minute for an hour of
+  audio. Speakers are labelled `SPEAKER_A`, `SPEAKER_B`, …, overlapping speech
+  is not flagged, and filler words ("um", "uh") are kept. `--no-align` drops the
+  speaker labels; `--diarization-backend` cannot select another diarizer.
+- **`gpt`** — the multi-stage pipeline described in the rest of this document.
+
+On a 48-minute, six-person meeting the two transcripts were of comparable
+accuracy — each got domain terms right that the other missed — while
+AssemblyAI's own speaker labels were cleaner at turn boundaries than labels
+reconciled onto `gpt-transcribe` text by forced alignment.
+
+## The `gpt` backend
+
 Transcribes an audio file with OpenAI's `gpt-transcribe`, diarizes it
 independently with a local pyannote Community-1 or pyannoteAI `precision-2`, and
 reconciles the two with WhisperX's wav2vec2 forced aligner. Transcription and
@@ -48,6 +68,8 @@ OPENAI_API_KEY=sk-...
 PYANNOTE_API_KEY=...
 ```
 
+`ASSEMBLYAI_API_KEY` (or `ASSEMBLYAI_KEY`) is all the default `assemblyai`
+transcription backend needs; the rest apply to `--transcription-backend gpt`.
 `PYANNOTE_API_KEY` is only needed by the hosted diarizer; the default local
 backend uses `HF_TOKEN` instead, and neither is needed with `--no-align`. See
 [Diarization backends](#diarization-backends).
@@ -77,7 +99,9 @@ environment yourself.
 
 ## Diarization backends
 
-Diarization is the only stage with a choice of provider. Both return the same
+This section applies to `--transcription-backend gpt`; the default `assemblyai`
+transcriber always uses its own speaker labels. Under `gpt`, diarization has a
+choice of provider. All return the same
 regular and exclusive timelines, so everything downstream — alignment,
 attribution, the JSON schema — is identical either way. The backend used is
 recorded in `models.diarization` in the output.
@@ -86,6 +110,13 @@ recorded in `models.diarization` in the output.
 | --- | --- | --- | --- |
 | `community` (default) | `pyannote/speaker-diarization-community-1` | your machine | one-time model download |
 | `pyannote` | `precision-2` | pyannoteAI's API | `PYANNOTE_API_KEY` |
+| `assemblyai` | speaker labels | AssemblyAI's API | `ASSEMBLYAI_API_KEY` (or `ASSEMBLYAI_KEY`) |
+
+AssemblyAI has no diarization-only endpoint, so the `assemblyai` backend runs a
+full AssemblyAI transcription job and keeps only its speaker timeline; the words
+still come from `gpt-transcribe`. It does not report overlapping speech, so its
+exclusive timeline is the same as its regular one, and its speakers are labelled
+`SPEAKER_A`, `SPEAKER_B`, … rather than `SPEAKER_00`.
 
 Select it per run or for the whole shell:
 
@@ -179,7 +210,8 @@ change the default directory, and `--quiet` to suppress the stdout copy.
 | `--language` | ISO-639-1 code; also selects the alignment model |
 | `--speakers` | Known speaker count, passed to diarization |
 | `--device` | Force the alignment device (`cpu`, `cuda`) |
-| `--diarization-backend` | `community` (local, default) or `pyannote` (hosted); overrides `DIARIZATION_BACKEND` |
+| `--transcription-backend` | `assemblyai` (default, single job) or `gpt` (multi-stage); overrides `TRANSCRIPTION_BACKEND` |
+| `--diarization-backend` | With `gpt` only: `community` (local, default), `pyannote` (hosted), or `assemblyai` (hosted); overrides `DIARIZATION_BACKEND` |
 | `--diarization-device` | Force the local diarization device (`cpu`, `cuda`, `mps`); `community` only |
 | `--no-denoise` | Keep filtering and normalization, skip noise reduction |
 | `--no-preprocess` | Send the original audio unchanged |
