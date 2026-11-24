@@ -11,6 +11,11 @@ https://hf.co/pyannote/speaker-diarization-community-1 and put a token with
 access to it in `.env` as `HF_TOKEN` before running this.
 
     uv run python scripts/setup_diarization.py [--force]
+
+`TRANSCRIBE_DIARIZE_VENV` relocates the environment. With `--models-only` the
+environment is assumed to exist already and only the download runs, which is how
+the container image — where the environment is baked into the image and the
+weights are not — warms its cache.
 """
 
 from __future__ import annotations
@@ -29,9 +34,13 @@ if str(ROOT) not in sys.path:
 from transcribe_pipeline.config import (  # noqa: E402 - needs ROOT on sys.path
     COMMUNITY_MODEL_ID,
     DEFAULT_DIARIZE_PYTHON,
-    DIARIZE_VENV,
+    diarize_venv,
     load_environment,
 )
+
+# Honours TRANSCRIBE_DIARIZE_VENV, so this builds the same environment the
+# pipeline will later look for — including inside the container image.
+DIARIZE_VENV = diarize_venv()
 
 WARMUP = """
 import os
@@ -65,9 +74,18 @@ def venv_python() -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--force", action="store_true", help="Recreate the environment")
+    parser.add_argument(
+        "--models-only",
+        action="store_true",
+        help=(
+            "Download the model into an environment that already exists, without "
+            "creating or installing into it. This is how the container image warms "
+            "its cache: the environment is baked in, only the weights are missing."
+        ),
+    )
     args = parser.parse_args()
 
-    if not shutil.which("uv"):
+    if not args.models_only and not shutil.which("uv"):
         raise SystemExit("uv is required to build the diarization environment")
 
     # The token lives in `.env` alongside the API keys, so load it the same way
@@ -80,15 +98,20 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    if args.force and DIARIZE_VENV.exists():
-        print(f"Removing {DIARIZE_VENV}...", file=sys.stderr)
-        shutil.rmtree(DIARIZE_VENV)
+    if args.models_only:
+        if args.force:
+            raise SystemExit("--models-only and --force contradict each other")
+    else:
+        if args.force and DIARIZE_VENV.exists():
+            print(f"Removing {DIARIZE_VENV}...", file=sys.stderr)
+            shutil.rmtree(DIARIZE_VENV)
 
-    if not DIARIZE_VENV.exists():
-        run(["uv", "venv", "--python", DEFAULT_DIARIZE_PYTHON, str(DIARIZE_VENV)])
+        if not DIARIZE_VENV.exists():
+            run(["uv", "venv", "--python", DEFAULT_DIARIZE_PYTHON, str(DIARIZE_VENV)])
 
     python = venv_python()
-    run(["uv", "pip", "install", "--python", str(python), "pyannote.audio"])
+    if not args.models_only:
+        run(["uv", "pip", "install", "--python", str(python), "pyannote.audio"])
     run([str(python), "-c", WARMUP, COMMUNITY_MODEL_ID], env=dict(os.environ))
 
     print(f"\nDiarization environment ready at {DIARIZE_VENV}", file=sys.stderr)

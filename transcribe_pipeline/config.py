@@ -21,14 +21,15 @@ DIARIZATION_MODEL = "precision-2"
 
 PYANNOTE_API_BASE = "https://api.pyannote.ai/v1"
 
-# Diarization backends. `pyannote` is the hosted pyannoteAI `precision-2` API and
-# stays the default; `community` runs pyannote's open Community-1 pipeline
-# locally. They are never substituted for one another: switching backend changes
-# cost and quality, so a missing setup fails rather than falling back.
+# Diarization backends. `community` runs pyannote's open Community-1 pipeline
+# locally and is the default: it has no per-minute bill and needs no API key.
+# `pyannote` is the hosted pyannoteAI `precision-2` API. They are never
+# substituted for one another: switching backend changes cost and quality, so a
+# missing setup fails rather than falling back.
 DIARIZATION_BACKEND_PYANNOTE = "pyannote"
 DIARIZATION_BACKEND_COMMUNITY = "community"
 DIARIZATION_BACKENDS = (DIARIZATION_BACKEND_PYANNOTE, DIARIZATION_BACKEND_COMMUNITY)
-DEFAULT_DIARIZATION_BACKEND = DIARIZATION_BACKEND_PYANNOTE
+DEFAULT_DIARIZATION_BACKEND = DIARIZATION_BACKEND_COMMUNITY
 
 COMMUNITY_MODEL_ID = "pyannote/speaker-diarization-community-1"
 COMMUNITY_DIARIZATION_MODEL = "community-1"
@@ -45,7 +46,9 @@ DEFAULT_ALIGN_PYTHON = "3.12"
 ALIGN_WORKER = PROJECT_ROOT / "workers" / "align_worker.py"
 
 # Prepared by `scripts/setup_alignment.py`. When present it is used directly,
-# which avoids re-resolving whisperx on every run.
+# which avoids re-resolving whisperx on every run. `TRANSCRIBE_ALIGN_VENV`
+# relocates it, which is how the container image points at an environment built
+# outside the project directory so a bind-mounted checkout cannot shadow it.
 ALIGN_VENV = PROJECT_ROOT / ".venv-align"
 
 # Local diarization runs out-of-process for the same reason: pyannote.audio pulls
@@ -54,7 +57,8 @@ ALIGN_VENV = PROJECT_ROOT / ".venv-align"
 DEFAULT_DIARIZE_PYTHON = "3.12"
 DIARIZE_WORKER = PROJECT_ROOT / "workers" / "diarize_worker.py"
 
-# Prepared by `scripts/setup_diarization.py`.
+# Prepared by `scripts/setup_diarization.py`; `TRANSCRIBE_DIARIZE_VENV`
+# relocates it, as above.
 DIARIZE_VENV = PROJECT_ROOT / ".venv-diarize"
 
 
@@ -65,12 +69,30 @@ def _venv_python(venv: Path) -> Path | None:
     return None
 
 
+def _venv_location(variable: str, default: Path) -> Path:
+    """Where an out-of-process environment lives, honouring its override.
+
+    Read at call time rather than at import so tests and callers can relocate it
+    without reimporting the module.
+    """
+    override = os.environ.get(variable, "").strip()
+    return Path(override).expanduser() if override else default
+
+
+def align_venv() -> Path:
+    return _venv_location("TRANSCRIBE_ALIGN_VENV", ALIGN_VENV)
+
+
+def diarize_venv() -> Path:
+    return _venv_location("TRANSCRIBE_DIARIZE_VENV", DIARIZE_VENV)
+
+
 def align_venv_python() -> Path | None:
-    return _venv_python(ALIGN_VENV)
+    return _venv_python(align_venv())
 
 
 def diarize_venv_python() -> Path | None:
-    return _venv_python(DIARIZE_VENV)
+    return _venv_python(diarize_venv())
 
 
 def validate_diarization_backend(value: str | None, *, source: str) -> str:

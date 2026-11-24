@@ -126,7 +126,7 @@ class TestDocument:
         document, _ = pipeline.run(options())
 
         assert document.models["transcription"] == "gpt-transcribe"
-        assert document.models["diarization"] == "precision-2"
+        assert document.models["diarization"] == "community-1"
         assert document.models["cleanup"] == "gpt-5.6-terra"
 
     def test_speakers_come_from_diarization(self, stubbed):
@@ -195,19 +195,19 @@ class TestSkipFlags:
 
 
 class TestDiarizationBackends:
-    def test_the_hosted_backend_is_used_by_default(self, stubbed):
+    def test_the_community_backend_is_used_by_default(self, stubbed):
         document, _ = pipeline.run(options())
-
-        assert len(stubbed["hosted_calls"]) == 1
-        assert stubbed["local_calls"] == []
-        assert document.models["diarization"] == "precision-2"
-
-    def test_the_community_backend_runs_locally_and_is_recorded(self, stubbed):
-        document, _ = pipeline.run(options(diarization_backend="community"))
 
         assert len(stubbed["local_calls"]) == 1
         assert stubbed["hosted_calls"] == []
         assert document.models["diarization"] == "community-1"
+
+    def test_the_hosted_backend_runs_remotely_and_is_recorded(self, stubbed):
+        document, _ = pipeline.run(options(diarization_backend="pyannote"))
+
+        assert len(stubbed["hosted_calls"]) == 1
+        assert stubbed["local_calls"] == []
+        assert document.models["diarization"] == "precision-2"
 
     def test_the_community_backend_keeps_the_rest_of_the_pipeline_intact(self, stubbed):
         document, _ = pipeline.run(options(diarization_backend="community"))
@@ -255,7 +255,7 @@ class TestMissingCredentials:
         monkeypatch.delenv("PYANNOTE_API_KEY", raising=False)
 
         with pytest.raises(SystemExit, match="PYANNOTE_API_KEY"):
-            pipeline.run(options())
+            pipeline.run(options(diarization_backend="pyannote"))
 
     def test_the_community_backend_needs_no_pyannote_key(self, stubbed, monkeypatch):
         monkeypatch.delenv("PYANNOTE_API_KEY", raising=False)

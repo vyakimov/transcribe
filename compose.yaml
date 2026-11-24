@@ -1,0 +1,50 @@
+# Everything the pipeline needs, pinned together.
+#
+#   docker compose build
+#   docker compose run --rm warmup            # once: downloads the models
+#   docker compose run --rm transcribe transcribe --audio input/interview.m4a --language en
+#
+# `transcribe` is the entrypoint, so the first argument after the service name
+# is the action.
+
+x-common: &common
+  build:
+    context: .
+    target: runtime
+  image: transcribe:latest
+  env_file:
+    # Credentials stay on the host. OPENAI_API_KEY is always needed; HF_TOKEN is
+    # needed once, to download the gated Community-1 weights. Optional so the
+    # image can be built and tested before either exists.
+    - path: .env
+      required: false
+  volumes:
+    - ./input:/app/input:ro
+    - ./output:/app/output
+    # Model weights survive rebuilds here rather than being baked into a layer.
+    - models:/cache
+  working_dir: /app
+
+services:
+  transcribe:
+    <<: *common
+
+  # One-time model download. Community-1 is gated: accept the conditions at
+  # https://hf.co/pyannote/speaker-diarization-community-1 and put a token with
+  # access to it in .env as HF_TOKEN before running this.
+  warmup:
+    <<: *common
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        python scripts/setup_diarization.py --models-only
+        python scripts/setup_alignment.py --models-only --language "${TRANSCRIBE_LANGUAGE:-en}"
+
+  # Proves the image itself is sound, independently of any credentials.
+  tests:
+    <<: *common
+    entrypoint: ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+    command: []
+
+volumes:
+  models:

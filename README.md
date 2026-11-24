@@ -1,7 +1,7 @@
 # Hosted transcription with speaker attribution
 
 Transcribes an audio file with OpenAI's `gpt-transcribe`, diarizes it
-independently with pyannoteAI `precision-2` or a local pyannote Community-1, and
+independently with a local pyannote Community-1 or pyannoteAI `precision-2`, and
 reconciles the two with WhisperX's wav2vec2 forced aligner. Transcription and
 diarization never see each other's output, so crosstalk cannot duplicate text or
 silently reassign it.
@@ -35,8 +35,11 @@ silently reassign it.
 brew install ffmpeg                              # macOS; omit if already installed
 uv sync
 uv run python scripts/setup_alignment.py         # builds the aligner environment
-uv run python scripts/setup_diarization.py       # optional: local diarization
+uv run python scripts/setup_diarization.py       # builds the local diarizer (default)
 ```
+
+Or skip all of it and run [in Docker](#running-in-docker), which pins ffmpeg and
+both torch stacks together so a host upgrade cannot break them.
 
 Put both keys in `.env` at the project root:
 
@@ -45,7 +48,7 @@ OPENAI_API_KEY=sk-...
 PYANNOTE_API_KEY=...
 ```
 
-`PYANNOTE_API_KEY` is only needed by the default hosted diarizer; the local
+`PYANNOTE_API_KEY` is only needed by the hosted diarizer; the default local
 backend uses `HF_TOKEN` instead, and neither is needed with `--no-align`. See
 [Diarization backends](#diarization-backends).
 
@@ -68,7 +71,8 @@ automatically.
 
 If `.venv-align` is absent, the worker falls back to building a throwaway
 environment on demand with `uv run --no-project --python 3.12 --with whisperx`.
-Set `TRANSCRIBE_ALIGN_CMD` to override the command entirely if you manage that
+`TRANSCRIBE_ALIGN_VENV` points at an environment built somewhere else, and
+`TRANSCRIBE_ALIGN_CMD` overrides the command entirely if you manage that
 environment yourself.
 
 ## Diarization backends
@@ -80,14 +84,14 @@ recorded in `models.diarization` in the output.
 
 | Backend | Model | Runs | Needs |
 | --- | --- | --- | --- |
-| `pyannote` (default) | `precision-2` | pyannoteAI's API | `PYANNOTE_API_KEY` |
-| `community` | `pyannote/speaker-diarization-community-1` | your machine | one-time model download |
+| `community` (default) | `pyannote/speaker-diarization-community-1` | your machine | one-time model download |
+| `pyannote` | `precision-2` | pyannoteAI's API | `PYANNOTE_API_KEY` |
 
 Select it per run or for the whole shell:
 
 ```bash
-uv run python transcribe.py input/interview.m4a --diarization-backend community
-DIARIZATION_BACKEND=community uv run python transcribe.py input/interview.m4a
+uv run python transcribe.py input/interview.m4a --diarization-backend pyannote
+DIARIZATION_BACKEND=pyannote uv run python transcribe.py input/interview.m4a
 ```
 
 `--diarization-backend` overrides `DIARIZATION_BACKEND`, and an unrecognized
@@ -116,8 +120,15 @@ That creates `.venv-diarize` (torch and pyannote.audio, on Python 3.12 for the
 same reason the aligner is) and pre-downloads the model. `HF_TOKEN` is only
 needed to *download* the gated weights; once they are cached, runs work offline
 without it. As with alignment, the worker will build a throwaway environment on
-demand if `.venv-diarize` is missing, and `TRANSCRIBE_DIARIZE_CMD` overrides the
-command entirely.
+demand if `.venv-diarize` is missing; `TRANSCRIBE_DIARIZE_VENV` points at one
+built elsewhere, and `TRANSCRIBE_DIARIZE_CMD` overrides the command entirely.
+
+The worker decodes audio by running `ffmpeg` and handing pyannote a waveform
+rather than a path. pyannote's own decoder, torchcodec, ships prebuilt libraries
+linked to one ffmpeg ABI at a hard-coded rpath, so it stops loading the moment
+the host's ffmpeg moves to a different major version — which is a silent failure
+that only surfaces when you try to diarize. Driving ffmpeg directly, as the rest
+of the pipeline already does, removes that coupling.
 
 Local diarization defaults to CPU. Pass `--diarization-device cuda` or
 `--diarization-device mps` to use an accelerator; it is separate from `--device`,
@@ -125,13 +136,15 @@ which selects the *alignment* device.
 
 ### Which to use
 
-Community-1 is documented as substantially better than the older open pyannote
-3.1, and it is a true diarizer with an exclusive speaker timeline, so it slots
-into the attribution logic without compromise. Running it yourself has no
-recurring provider bill; hosted Community-1 still sits behind
-[pyannote's monthly plans](https://www.pyannote.ai/pricing). The hosted
-`precision-2` stays the default because it needs no local GPU, no multi-gigabyte
-download, and no model-license acceptance.
+Community-1 is the default. It is documented as substantially better than the
+older open pyannote 3.1, and it is a true diarizer with an exclusive speaker
+timeline, so it slots into the attribution logic without compromise. Running it
+yourself has no recurring provider bill and no API key; hosted Community-1 still
+sits behind [pyannote's monthly plans](https://www.pyannote.ai/pricing).
+
+The cost is setup: a one-time multi-gigabyte model download, acceptance of the
+model license, and CPU time per run. Choose hosted `precision-2` instead when
+you would rather not carry any of that locally.
 
 Published diarization benchmarks vary substantially by domain, so run both
 against representative audio before committing to one.
@@ -166,7 +179,7 @@ change the default directory, and `--quiet` to suppress the stdout copy.
 | `--language` | ISO-639-1 code; also selects the alignment model |
 | `--speakers` | Known speaker count, passed to diarization |
 | `--device` | Force the alignment device (`cpu`, `cuda`) |
-| `--diarization-backend` | `pyannote` (hosted, default) or `community` (local); overrides `DIARIZATION_BACKEND` |
+| `--diarization-backend` | `community` (local, default) or `pyannote` (hosted); overrides `DIARIZATION_BACKEND` |
 | `--diarization-device` | Force the local diarization device (`cpu`, `cuda`, `mps`); `community` only |
 | `--no-denoise` | Keep filtering and normalization, skip noise reduction |
 | `--no-preprocess` | Send the original audio unchanged |
@@ -277,6 +290,61 @@ Attribution rules, applied per word:
 never erases the fact that more than one person was talking. The readable
 transcript groups by speaker so a one-word interjection does not chop a sentence
 in half, and reports the overlap count in its header.
+
+## Running in Docker
+
+The laptop setup has one fragile joint: three Python environments, two torch
+stacks, and a system ffmpeg that upgrades on its own schedule. When ffmpeg moves
+to a new major version, pyannote's prebuilt decoder stops loading and local
+diarization dies. The image pins all of it together.
+
+```bash
+docker compose build
+docker compose run --rm warmup     # once: downloads the models into a volume
+docker compose run --rm transcribe transcribe \
+    --audio input/interview.m4a --language en
+```
+
+`transcribe` is the image's entrypoint, so the first argument after the service
+name is the action — `check-setup`, `transcribe`, `job-status`, and the rest
+behave exactly as they do on the host, and stdout is still a single JSON object.
+
+| Path | What it is |
+| --- | --- |
+| `./input` | mounted read-only; recordings never enter the image |
+| `./output` | mounted read-write; transcripts land on the host |
+| `.env` | read at runtime; credentials are never baked into a layer |
+| `models` volume | model weights and job state, kept across rebuilds |
+
+### What the image pins
+
+| | Version |
+| --- | --- |
+| ffmpeg | Debian trixie's, installed at build time |
+| Project | Python 3.14 |
+| Aligner (`/opt/venvs/align`) | Python 3.12, whisperx, CPU torch |
+| Diarizer (`/opt/venvs/diarize`) | Python 3.12, pyannote.audio, CPU torch |
+
+The two worker environments build as independent stages, so their torch
+downloads run in parallel and neither can perturb the other's pin. They live
+outside `/app` and are found through `TRANSCRIBE_ALIGN_VENV` and
+`TRANSCRIBE_DIARIZE_VENV`, so bind-mounting a checkout over `/app` for
+development cannot shadow them.
+
+Weights are **not** baked in. Community-1 is gated, so shipping it would
+redistribute a licensed model and would need a build-time token; `warmup`
+downloads it into the `models` volume instead, using the `HF_TOKEN` from `.env`.
+Do that once — afterwards the container runs without `HF_TOKEN` at all.
+
+The image is CPU-only: Docker Desktop on macOS exposes no CUDA device, and the
+CUDA wheels are several gigabytes each. On a CUDA host, run on the host rather
+than in this image, or rebuild the two worker stages without `--torch-backend=cpu`.
+
+To check the image itself, independently of any credentials:
+
+```bash
+docker compose run --rm tests
+```
 
 ## Tests
 

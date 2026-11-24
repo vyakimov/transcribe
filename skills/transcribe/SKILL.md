@@ -89,7 +89,7 @@ Key parameters (`--audio` is required):
 | `--audio PATH` | Input audio file |
 | `--language CODE` | ISO-639-1, e.g. `en`. Also selects the alignment model. Pass it when known — it improves accuracy |
 | `--speakers N` | Known speaker count, if you have it |
-| `--diarization-backend` | `pyannote` (hosted, default) or `community` (local) |
+| `--diarization-backend` | `community` (local, default) or `pyannote` (hosted) |
 | `--diarization-device` | `cpu` (default), `cuda`, or `mps` — local backend only |
 | `--output-dir DIR` | Where the three output files land |
 | `--include-text` | Also return the readable transcript inline in `result.transcript` |
@@ -181,12 +181,12 @@ absent from a truncated list.
 
 ## Choosing a diarization backend
 
-| | `pyannote` (default) | `community` |
+| | `community` (default) | `pyannote` |
 | --- | --- | --- |
-| Runs on | pyannoteAI's API | this machine |
-| Needs | `PYANNOTE_API_KEY` | `.venv-diarize` built once |
-| Per-run cost | billed by pyannoteAI | none |
-| First-run setup | none | ~1 GB download, gated model |
+| Runs on | this machine | pyannoteAI's API |
+| Needs | `.venv-diarize` built once | `PYANNOTE_API_KEY` |
+| Per-run cost | none | billed by pyannoteAI |
+| First-run setup | ~1 GB download, gated model | none |
 
 They are **not** interchanged automatically. If the selected backend is not
 ready, the call fails rather than quietly switching — switching would change

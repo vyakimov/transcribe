@@ -39,8 +39,10 @@ from transcribe_pipeline.config import (
     DIARIZATION_BACKEND_PYANNOTE,
     DIARIZATION_BACKENDS,
     PROJECT_ROOT,
+    align_venv,
     align_venv_python,
     diarization_model_name,
+    diarize_venv,
     diarize_venv_python,
     load_environment,
     resolve_diarization_backend,
@@ -553,11 +555,12 @@ def action_check_setup(args: argparse.Namespace) -> dict:
         DIARIZATION_BACKEND_COMMUNITY: {
             "ready": diarize_python is not None,
             "model": diarization_model_name(DIARIZATION_BACKEND_COMMUNITY),
-            "requires": [".venv-diarize"],
+            # The real location, which TRANSCRIBE_DIARIZE_VENV may have moved.
+            "requires": [str(diarize_venv())],
             "blockers": (
                 []
                 if diarize_python is not None
-                else ["run scripts/setup_diarization.py to build .venv-diarize"]
+                else [f"run scripts/setup_diarization.py to build {diarize_venv()}"]
             ),
         },
     }
@@ -568,7 +571,7 @@ def action_check_setup(args: argparse.Namespace) -> dict:
     if not credentials["OPENAI_API_KEY"]:
         blockers.append("OPENAI_API_KEY is not set")
     if align_python is None:
-        blockers.append("run scripts/setup_alignment.py to build .venv-align")
+        blockers.append(f"run scripts/setup_alignment.py to build {align_venv()}")
 
     return {
         "ready": not blockers,
@@ -626,7 +629,7 @@ def _transcribe_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--diarization-backend",
         choices=list(DIARIZATION_BACKENDS),
-        help="pyannote (hosted precision-2, default) or community (local Community-1)",
+        help="community (local Community-1, default) or pyannote (hosted precision-2)",
     )
     parser.add_argument(
         "--diarization-device", help="Device for local diarization: cpu, cuda, or mps"
@@ -745,7 +748,15 @@ def action_transcribe(args: argparse.Namespace) -> dict:
             "PYANNOTE_API_KEY"
         ):
             missing.append("PYANNOTE_API_KEY")
-        if align and backend == DIARIZATION_BACKEND_COMMUNITY and diarize_venv_python() is None:
+        # TRANSCRIBE_DIARIZE_CMD supplies the worker command directly, which is
+        # how the container image points at its own environment. When it is set
+        # there is no `.venv-diarize` to look for.
+        if (
+            align
+            and backend == DIARIZATION_BACKEND_COMMUNITY
+            and diarize_venv_python() is None
+            and not os.environ.get("TRANSCRIBE_DIARIZE_CMD", "").strip()
+        ):
             missing.append(".venv-diarize")
 
         return {

@@ -22,16 +22,30 @@ pyannoteAI API returns, so both backends land in the same `DiarizationResult`.
 `HF_TOKEN` is read from the environment rather than the request, so the
 credential never reaches a temporary file on disk. It is only needed to download
 the gated model; once cached, runs need no token at all.
+
+Audio is decoded here with the ffmpeg CLI and handed to pyannote as a waveform
+dictionary rather than as a path. pyannote's own decoder is torchcodec, whose
+prebuilt libraries are linked against a specific ffmpeg ABI at a hard-coded
+rpath, so it breaks whenever the host's ffmpeg is a different major version or
+sits at a different prefix. The rest of this project already drives ffmpeg
+directly, so decoding here removes that fragile native dependency instead of
+trying to satisfy it.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 DEFAULT_DEVICE = "cpu"
+
+# pyannote's models run at 16 kHz. Decoding straight to that rate hands the
+# pipeline exactly what it wants and skips a redundant torchaudio resample.
+PYANNOTE_SAMPLE_RATE = 16000
 
 
 def _loose_pairs(annotation):
@@ -69,8 +83,75 @@ def extract_turns(annotation) -> list[dict]:
     return turns
 
 
+def decode_audio(path: str):
+    """Decode any ffmpeg-readable file to a mono (1, time) float32 tensor.
+
+    Returns the waveform dictionary pyannote accepts in place of a path, which
+    is the documented escape hatch from its torchcodec-based decoding.
+    """
+    import torch
+
+    if not shutil.which("ffmpeg"):
+        raise SystemExit(
+            "ffmpeg is required to decode audio for local diarization but was "
+            "not found on PATH."
+        )
+
+    if not Path(path).is_file():
+        raise SystemExit(f"Audio file not found: {path}")
+
+    print(f"Decoding {Path(path).name} with ffmpeg...", file=sys.stderr)
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-v",
+            "error",
+            "-i",
+            path,
+            "-vn",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-ac",
+            "1",
+            "-ar",
+            str(PYANNOTE_SAMPLE_RATE),
+            "-",
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        raise SystemExit(f"ffmpeg could not decode {path}: {detail}")
+    if not completed.stdout:
+        raise SystemExit(f"ffmpeg produced no audio samples for {path}")
+
+    # frombuffer would alias a read-only buffer, so copy into a writable tensor.
+    waveform = torch.frombuffer(bytearray(completed.stdout), dtype=torch.float32)
+    return {
+        "waveform": waveform.reshape(1, -1),
+        "sample_rate": PYANNOTE_SAMPLE_RATE,
+        "uri": Path(path).stem,
+    }
+
+
 def load_pipeline(model: str, device: str):
     """Load Community-1, translating the gated-model failure into advice."""
+    # We decode with ffmpeg and never touch torchcodec, but importing pyannote
+    # still probes for it and warns at length when its libraries will not load.
+    # That warning reads exactly like a fatal error, so drop this one message.
+    # Imported here, not at module scope, because `main` binds `warnings` to a
+    # list of the warnings this worker reports back to the caller.
+    import warnings
+
+    warnings.filterwarnings(
+        "ignore", message=r"\s*torchcodec is not installed correctly"
+    )
+
     import torch
     from pyannote.audio import Pipeline
 
@@ -119,8 +200,10 @@ def main() -> int:
     if num_speakers:
         options["num_speakers"] = int(num_speakers)
 
+    audio = decode_audio(request["audio"])
+
     print("Diarizing...", file=sys.stderr)
-    output = pipeline(request["audio"], **options)
+    output = pipeline(audio, **options)
 
     warnings: list[str] = []
     diarization = extract_turns(getattr(output, "speaker_diarization", output))

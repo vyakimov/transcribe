@@ -1,0 +1,32 @@
+# Host virtual environments must never enter the image: they are built against
+# the host's ffmpeg and Python, which is exactly the coupling the image removes.
+.venv
+.venv-align
+.venv-diarize
+
+# Secrets are mounted at runtime, never baked into a layer.
+.env
+
+# Recordings and transcripts are bind-mounted, not shipped.
+input/
+output/
+.transcribe-jobs/
+
+.git/
+.github/
+__pycache__/
+**/__pycache__/
+*.py[oc]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+wheels/
+*.egg-info
+
+.DS_Store
+plans/
+Dockerfile
+compose.yaml
+.dockerignore

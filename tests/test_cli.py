@@ -358,7 +358,7 @@ class TestDryRun:
         self, capfd, isolated_env, fake_media, monkeypatch, tmp_path
     ):
         monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
-        monkeypatch.setenv("PYANNOTE_API_KEY", "pk-x")
+        monkeypatch.setattr(transcribe_cli, "diarize_venv_python", lambda: Path("python"))
         called = []
         monkeypatch.setattr(
             "transcribe_pipeline.pipeline.run", lambda options: called.append(options)
@@ -371,7 +371,7 @@ class TestDryRun:
         assert called == []
         assert payload["result"]["dry_run"] is True
         assert payload["result"]["would_run"] is True
-        assert payload["result"]["models"]["diarization"] == "precision-2"
+        assert payload["result"]["models"]["diarization"] == "community-1"
 
     def test_a_dry_run_names_the_missing_requirements(
         self, capfd, isolated_env, fake_media, tmp_path
@@ -379,7 +379,11 @@ class TestDryRun:
         audio = tmp_path / "a.m4a"
         audio.write_bytes(b"x")
 
-        _, payload, _ = invoke(capfd, ["transcribe", "--audio", str(audio), "--dry-run"])
+        _, payload, _ = invoke(
+            capfd,
+            ["transcribe", "--audio", str(audio), "--diarization-backend", "pyannote",
+             "--dry-run"],
+        )
 
         assert payload["ok"] is True  # a plan is a successful answer
         assert payload["result"]["would_run"] is False
@@ -401,6 +405,25 @@ class TestDryRun:
 
         assert payload["result"]["missing_requirements"] == [".venv-diarize"]
         assert payload["result"]["models"]["diarization"] == "community-1"
+
+    def test_a_worker_command_override_replaces_the_environment_requirement(
+        self, capfd, isolated_env, fake_media, monkeypatch, tmp_path
+    ):
+        # How the container image supplies the worker: no `.venv-diarize` exists,
+        # but the command that runs it does.
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+        monkeypatch.setenv("TRANSCRIBE_DIARIZE_CMD", "/opt/venvs/diarize/bin/python worker.py")
+        monkeypatch.setattr(transcribe_cli, "diarize_venv_python", lambda: None)
+        audio = tmp_path / "a.m4a"
+        audio.write_bytes(b"x")
+
+        _, payload, _ = invoke(
+            capfd,
+            ["transcribe", "--audio", str(audio), "--diarization-backend", "community", "--dry-run"],
+        )
+
+        assert payload["result"]["missing_requirements"] == []
+        assert payload["result"]["would_run"] is True
 
     def test_no_align_needs_no_diarization_credentials(
         self, capfd, isolated_env, fake_media, monkeypatch, tmp_path

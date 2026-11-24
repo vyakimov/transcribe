@@ -98,6 +98,96 @@ class TestExtractTurns:
 # --- driver parsing -------------------------------------------------------------
 
 
+class TestAudioDecoding:
+    """The worker decodes with ffmpeg so pyannote never reaches for torchcodec,
+    whose prebuilt libraries are pinned to one ffmpeg ABI."""
+
+    @staticmethod
+    def _stub_torch(monkeypatch):
+        """A torch stand-in: this environment runs 3.14, where torch cannot install."""
+
+        class FakeTensor:
+            def __init__(self, data):
+                self.data = data
+                self.shape = (len(data),)
+
+            def reshape(self, *shape):
+                self.shape = shape
+                return self
+
+        fake = SimpleNamespace(
+            float32="float32",
+            frombuffer=lambda buffer, dtype: FakeTensor(bytes(buffer)),
+        )
+        monkeypatch.setitem(sys.modules, "torch", fake)
+
+    def test_the_waveform_is_mono_and_at_the_models_sample_rate(self, monkeypatch, tmp_path):
+        self._stub_torch(monkeypatch)
+        audio = tmp_path / "a.flac"
+        audio.write_bytes(b"x")
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return SimpleNamespace(returncode=0, stdout=b"\x00" * 16, stderr=b"")
+
+        monkeypatch.setattr(worker.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+        monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+        result = worker.decode_audio(str(audio))
+
+        assert result["sample_rate"] == worker.PYANNOTE_SAMPLE_RATE
+        assert result["waveform"].shape == (1, -1)
+        assert result["uri"] == "a"
+        assert commands[0][0] == "ffmpeg"
+        assert "-ac" in commands[0] and commands[0][commands[0].index("-ac") + 1] == "1"
+        assert commands[0][commands[0].index("-ar") + 1] == str(worker.PYANNOTE_SAMPLE_RATE)
+
+    def test_a_missing_ffmpeg_is_named(self, monkeypatch, tmp_path):
+        self._stub_torch(monkeypatch)
+        monkeypatch.setattr(worker.shutil, "which", lambda name: None)
+
+        with pytest.raises(SystemExit, match="ffmpeg is required"):
+            worker.decode_audio(str(tmp_path / "a.flac"))
+
+    def test_a_missing_file_is_named(self, monkeypatch, tmp_path):
+        self._stub_torch(monkeypatch)
+        monkeypatch.setattr(worker.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+
+        with pytest.raises(SystemExit, match="Audio file not found"):
+            worker.decode_audio(str(tmp_path / "missing.flac"))
+
+    def test_a_decode_failure_carries_ffmpegs_own_message(self, monkeypatch, tmp_path):
+        self._stub_torch(monkeypatch)
+        audio = tmp_path / "a.flac"
+        audio.write_bytes(b"x")
+        monkeypatch.setattr(worker.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+        monkeypatch.setattr(
+            worker.subprocess,
+            "run",
+            lambda command, **kwargs: SimpleNamespace(
+                returncode=1, stdout=b"", stderr=b"Invalid data found"
+            ),
+        )
+
+        with pytest.raises(SystemExit, match="Invalid data found"):
+            worker.decode_audio(str(audio))
+
+    def test_silence_is_not_mistaken_for_success(self, monkeypatch, tmp_path):
+        self._stub_torch(monkeypatch)
+        audio = tmp_path / "a.flac"
+        audio.write_bytes(b"x")
+        monkeypatch.setattr(worker.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+        monkeypatch.setattr(
+            worker.subprocess,
+            "run",
+            lambda command, **kwargs: SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+        )
+
+        with pytest.raises(SystemExit, match="no audio samples"):
+            worker.decode_audio(str(audio))
+
+
 class TestParseWorkerOutput:
     def test_regular_and_exclusive_turns_are_both_kept(self):
         result = parse_worker_output(
@@ -312,15 +402,15 @@ class TestDiarize:
 
 
 class TestBackendSelection:
-    def test_the_hosted_backend_is_the_default(self, monkeypatch):
+    def test_the_local_backend_is_the_default(self, monkeypatch):
         monkeypatch.delenv("DIARIZATION_BACKEND", raising=False)
 
-        assert resolve_diarization_backend(None) == DIARIZATION_BACKEND_PYANNOTE
+        assert resolve_diarization_backend(None) == DIARIZATION_BACKEND_COMMUNITY
 
     def test_the_environment_selects_a_backend(self, monkeypatch):
-        monkeypatch.setenv("DIARIZATION_BACKEND", "community")
+        monkeypatch.setenv("DIARIZATION_BACKEND", "pyannote")
 
-        assert resolve_diarization_backend(None) == DIARIZATION_BACKEND_COMMUNITY
+        assert resolve_diarization_backend(None) == DIARIZATION_BACKEND_PYANNOTE
 
     def test_the_cli_overrides_the_environment(self, monkeypatch):
         monkeypatch.setenv("DIARIZATION_BACKEND", "community")
@@ -347,7 +437,7 @@ class TestBackendSelection:
     def test_an_empty_environment_value_falls_back_to_the_default(self, monkeypatch):
         monkeypatch.setenv("DIARIZATION_BACKEND", "   ")
 
-        assert resolve_diarization_backend(None) == DIARIZATION_BACKEND_PYANNOTE
+        assert resolve_diarization_backend(None) == DIARIZATION_BACKEND_COMMUNITY
 
     def test_a_bad_backend_is_rejected_wherever_it_came_from(self):
         with pytest.raises(SystemExit, match="pyannote, community"):

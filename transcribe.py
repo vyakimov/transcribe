@@ -50,9 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--diarization-backend",
         help=(
-            f"Which diarizer to use ({' or '.join(DIARIZATION_BACKENDS)}): 'pyannote' "
-            "is the hosted precision-2 API (default), 'community' runs Community-1 "
-            "locally. Overrides DIARIZATION_BACKEND."
+            f"Which diarizer to use ({' or '.join(DIARIZATION_BACKENDS)}): 'community' "
+            "runs Community-1 locally (default), 'pyannote' is the hosted "
+            "precision-2 API. Overrides DIARIZATION_BACKEND."
         ),
     )
     parser.add_argument(
